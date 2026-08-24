@@ -1,0 +1,23 @@
+--- a/scripts/php-config.in
++++ b/scripts/php-config.in
+@@ -1,6 +1,6 @@
+ #! /bin/sh
+ 
+-SED="@SED@"
++SED="/bin/sed"
+ prefix="@prefix@"
+ datarootdir="@datarootdir@"
+ exec_prefix="@exec_prefix@"
+
+--- a/scripts/phpize.in
++++ b/scripts/phpize.in
+@@ -7,7 +7,7 @@
+ phpdir="$prefix/lib/php/@DEBIAN_PHP_API@/build"
+ includedir="$prefix/include/php/@DEBIAN_PHP_API@"
+ builddir="`pwd`"
+-SED="@SED@"
++SED="/bin/sed"
+ 
+ libtool_version=$(dpkg-query -f'${Version}' -W libtool)
+ aclocaldir="$prefix/share/aclocal"
+

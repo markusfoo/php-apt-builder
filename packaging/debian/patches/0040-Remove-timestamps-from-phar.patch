@@ -1,0 +1,56 @@
+From: Vagrant Cascadian <vagrant@reproducible-builds.org>
+Date: Tue, 25 Apr 2023 11:20:24 -0700
+Subject: Remove timestamps from "phar".
+
+Thanks to Jelle van der Waa!
+
+https://gist.github.com/jelly/96847934239aac19c512c54ca65d6baa
+---
+ ext/phar/phar.c | 2 +-
+ ext/phar/util.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+--- a/ext/phar/phar.c
++++ b/ext/phar/phar.c
+@@ -2903,7 +2903,7 @@
+ 			4: metadata-len
+ 			+: metadata
+ 		*/
+-		mytime = time(NULL);
++		mytime = 0;
+ 		phar_set_32(entry_buffer, entry->uncompressed_filesize);
+ 		phar_set_32(entry_buffer+4, mytime);
+ 		phar_set_32(entry_buffer+8, entry->compressed_filesize);
+
+--- a/ext/phar/stream.c
++++ b/ext/phar/stream.c
+@@ -197,7 +197,7 @@
+ 	/* strip leading "/" */
+ 	internal_file = estrndup(ZSTR_VAL(resource->path) + 1, ZSTR_LEN(resource->path) - 1);
+ 	if (mode[0] == 'w' || (mode[0] == 'r' && mode[1] == '+')) {
+-		if (NULL == (idata = phar_get_or_create_entry_data(resource->host, internal_file, strlen(internal_file), mode, 0, &error, true, time(NULL)))) {
++		if (NULL == (idata = phar_get_or_create_entry_data(resource->host, internal_file, strlen(internal_file), mode, 0, &error, true, 0))) {
+ 			if (error) {
+ 				php_stream_wrapper_log_warn(wrapper, context, options, CreateFailed, "%s", error);
+ 				efree(error);
+
+--- a/ext/phar/phar_object.c
++++ b/ext/phar/phar_object.c
+@@ -1367,7 +1367,7 @@
+ 
+ 		timestamp = Z_LVAL(rv);
+ 	} else {
+-		timestamp = time(NULL);
++		timestamp = 0;
+ 	}
+ 
+ 	return phar_get_or_create_entry_data(fname, path, path_len, "w+b", 0, error, true, timestamp);
+@@ -3585,7 +3585,7 @@
+ 	}
+ #endif
+ 
+-	phar_entry_data *data = phar_get_or_create_entry_data((*pphar)->fname, filename, filename_len, "w+b", 0, &error, true, time(NULL));
++	phar_entry_data *data = phar_get_or_create_entry_data((*pphar)->fname, filename, filename_len, "w+b", 0, &error, true, 0);
+ 	if (!data) {
+ 		if (error) {
+ 			zend_throw_exception_ex(spl_ce_BadMethodCallException, 0, "Entry %s does not exist and cannot be created: %s", filename, error);

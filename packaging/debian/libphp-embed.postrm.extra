@@ -1,0 +1,6 @@
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+	if [ -L /usr/lib/libphp.so ] && [ "$(realpath -L /usr/lib/libphp.so)" =  /usr/lib/libphp@PHP_VERSION@.so ]; then
+		rm -f /usr/lib/libphp.so
+	fi
+	ldconfig
+fi

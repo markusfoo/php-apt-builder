@@ -1,0 +1,28 @@
+From: Debian PHP Maintainers <pkg-php-maint@lists.alioth.debian.org>
+Date: Sat, 2 May 2015 10:26:50 +0200
+Subject: libtool_fixes
+
+Refreshed for PHP 8.6.0beta1 (2026-08-13): upstream renamed the
+AC_PROG_LIBTOOL call to LT_INIT and added two PHP_HELP_SEPARATOR /
+PHP_CONFIGURE_PART lines just above it, which shifted this hunk's
+context enough that dpkg-source refused it as fuzzy. The actual line
+this patch removes, PHP_SET_LIBTOOL_VARIABLE([--silent]), is untouched
+by that rename and is still present verbatim; only the surrounding
+context lines changed. No functional change to what this patch does.
+
+---
+ configure.ac | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 57436a1..632c165 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1603,8 +1603,6 @@
+ 
+ LT_INIT
+ 
+-PHP_SET_LIBTOOL_VARIABLE([--silent])
+-
+ dnl libtool 1.4.3 needs this.
+ PHP_SET_LIBTOOL_VARIABLE([--preserve-dup-deps])

@@ -1,0 +1,572 @@
+name: E2E WordPress Audit (Post-Release)
+
+# ============================================================================
+# E2E WORDPRESS AUDIT WORKFLOW
+#
+# Downloads the latest .deb PHP packages, installs them on a clean Ubuntu
+# 22.04 container, sets up MariaDB + WordPress via WP-CLI, and runs a
+# comprehensive suite of compatibility tests against a LIVE WordPress site.
+#
+# PURPOSE:
+#   Proactively tests every new PHP build against the world's most popular
+#   CMS. Detects syntax errors, deprecations, runtime errors, and full
+#   Nginx + PHP-FPM + MySQL integration issues.
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to test (e.g. php8.6.0-beta1-1). Leave empty for latest."
+        type: string
+        required: false
+        default: ""
+      php_series:
+        description: "PHP series (must match release)"
+        type: string
+        default: "8.6"
+      wp_version:
+        description: "WordPress version to test (latest, nightly, or specific like 6.7.2)"
+        type: string
+        default: "latest"
+      commit_logs_on_failure:
+        description: "Commit audit logs to repo on test failure"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: e2e-audit-${{ inputs.php_series }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  # ==================================================================
+  # JOB 1 - Resolve: find the release tag
+  # ==================================================================
+  resolve:
+    name: Resolve release assets
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      php_series: ${{ steps.resolve.outputs.php_series }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="${{ inputs.release_tag }}"
+          SERIES="${{ inputs.php_series }}"
+
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 5 --json tagName -q '.[].tagName' | \
+              grep -E "^php${SERIES}" | head -1) || true
+            if [ -z "$TAG" ]; then
+              echo "::error::No release found for PHP series $SERIES"
+              exit 1
+            fi
+          fi
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "php_series=$SERIES" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: $TAG"
+
+  # ==================================================================
+  # JOB 2 - Full E2E WordPress Audit
+  # ==================================================================
+  audit:
+    name: E2E WordPress Audit
+    needs: resolve
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # -- Configure apt --
+      - name: Configure apt for CI reliability
+        run: |
+          set -euxo pipefail
+          mkdir -p /etc/apt/apt.conf.d
+          tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+
+      # -- Install basic tools in container --
+      - name: Install curl, git, gh, jq in container
+        run: |
+          set -euxo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl git jq
+          ARCH=$(dpkg --print-architecture)
+          GH_VERSION="2.67.0"
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" | \
+            tar xz -C /usr/local --strip-components=1 --wildcards '*/bin/gh'
+          gh --version
+
+      # -- Download release .deb files --
+      - name: Download all .deb files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          mkdir -p /tmp/debs
+
+          echo "Downloading .deb files from release $TAG..."
+          gh release download "$TAG" --repo '${{ github.repository }}' --dir /tmp/debs --pattern '*.deb' || {
+            echo "::error::Failed to download from release $TAG"
+            exit 1
+          }
+
+          echo "Downloaded $(ls /tmp/debs/*.deb | wc -l) .deb files"
+          ls -lh /tmp/debs/
+
+      # -- Install ALL system dependencies including MariaDB --
+      - name: Install system dependencies + MariaDB
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if timeout 120 apt-get update; then break; fi
+            echo "apt-get update attempt ${attempt} failed, retrying..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+          apt-get install -y --no-install-recommends \
+            gnupg ca-certificates curl nginx libfcgi0ldbl python3 \
+            mariadb-server mariadb-client
+
+      - name: Add packages.sury.org/php (runtime deps)
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then break; fi
+            sleep 5
+          done
+
+      # -- Install PHP .deb packages --
+      - name: Install PHP .deb packages
+        run: |
+          set -euxo pipefail
+          dpkg -i /tmp/debs/*.deb || apt-get -f install -y
+
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          PHP_BIN="/usr/bin/php${SERIES}"
+
+          echo "=== PHP Installation Verified ==="
+          $PHP_BIN -v
+          echo ""
+          echo "Loaded extensions:"
+          $PHP_BIN -m 2>/dev/null | sort || true
+
+          # Verify critical WordPress extensions
+          echo ""
+          echo "=== WordPress Extension Check ==="
+          for ext in mysqli pdo_mysql pdo mbstring xml curl json gd zip openssl simplexml dom xmlreader xmlwriter intl; do
+            if $PHP_BIN -m | grep -qi "^${ext}$"; then
+              echo "  ✅ $ext"
+            else
+              echo "  ⚠️  $ext (missing - may need php${SERIES}-${ext})"
+            fi
+          done
+
+      # -- Start MariaDB and create database --
+      - name: Start MariaDB and create WordPress database
+        run: |
+          set -euxo pipefail
+
+          # MariaDB in Docker container: set up dirs and start daemon
+          mkdir -p /run/mysqld /var/run/mysqld
+          chown mysql:mysql /run/mysqld /var/run/mysqld
+
+          # Start MariaDB directly (no systemd in container)
+          # Use default Ubuntu socket path so WP-CLI/PHP can connect via localhost
+          mysqld --user=mysql --datadir=/var/lib/mysql \
+            --socket=/var/run/mysqld/mysqld.sock \
+            --pid-file=/var/run/mysqld/mysqld.pid &
+          sleep 5
+
+          # Wait for MariaDB to be ready
+          for i in $(seq 1 30); do
+            if mysqladmin ping --silent 2>/dev/null; then
+              echo "MariaDB is ready"
+              break
+            fi
+            echo "Waiting for MariaDB... ($i/30)"
+            sleep 1
+          done
+
+          mysqladmin ping --silent || {
+            echo "::error::MariaDB failed to start"
+            cat /var/log/mysql/error.log 2>/dev/null || true
+            exit 1
+          }
+
+          # Create database and user (fresh install has no root password)
+          mysql -u root -e "
+            CREATE DATABASE IF NOT EXISTS wordpress;
+            CREATE USER IF NOT EXISTS 'admin'@'localhost' IDENTIFIED BY 'admin';
+            GRANT ALL PRIVILEGES ON wordpress.* TO 'admin'@'localhost';
+            FLUSH PRIVILEGES;
+            SELECT User, Host FROM mysql.user WHERE User='admin';
+            SHOW DATABASES LIKE 'wordpress';
+          "
+          echo "Database 'wordpress' created with user 'admin'@'localhost'"
+
+          # Verify connection
+          mysql -u admin -padmin -e "SELECT 'DB_CONNECTION_OK' AS status;" wordpress
+
+      # -- Download and deploy WordPress --
+      - name: Download and deploy WordPress
+        run: |
+          set -euxo pipefail
+          WP_VER="${{ inputs.wp_version }}"
+          mkdir -p /var/www/html
+
+          if [ "$WP_VER" = "nightly" ] || [ "$WP_VER" = "nightly-build" ]; then
+            curl -fsSL https://wordpress.org/nightly-builds/wordpress-latest.zip -o /tmp/wp.zip
+            apt-get install -y --no-install-recommends unzip
+            unzip -q /tmp/wp.zip -d /tmp
+            cp -a /tmp/wordpress/. /var/www/html/
+            rm -rf /tmp/wordpress /tmp/wp.zip
+          elif [ "$WP_VER" = "latest" ]; then
+            curl -fsSL https://wordpress.org/latest.tar.gz | tar xz -C /tmp
+            cp -a /tmp/wordpress/. /var/www/html/
+            rm -rf /tmp/wordpress
+          else
+            curl -fsSL "https://wordpress.org/wordpress-${WP_VER}.tar.gz" | tar xz -C /tmp
+            cp -a /tmp/wordpress/. /var/www/html/
+            rm -rf /tmp/wordpress
+          fi
+          echo "WordPress files deployed:"
+          ls /var/www/html/wp-login.php
+          echo "Total files: $(find /var/www/html -type f | wc -l)"
+
+      # -- Install WP-CLI --
+      - name: Install WP-CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp
+          chmod +x /usr/local/bin/wp
+          wp --version --allow-root
+
+      # -- Install WordPress via WP-CLI --
+      - name: Install WordPress via WP-CLI
+        run: |
+          set -euxo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          PHP_BIN="/usr/bin/php${SERIES}"
+
+          cd /var/www/html
+
+          # Generate wp-config.php
+          wp config create \
+            --dbname=wordpress \
+            --dbuser=admin \
+            --dbpass=admin \
+            --dbhost=localhost \
+            --allow-root \
+            --path=/var/www/html
+
+          echo "wp-config.php created"
+
+          # Run the WordPress installation
+          wp core install \
+            --url="http://localhost:8080" \
+            --title="E2E PHP Audit Test Site" \
+            --admin_user="admin" \
+            --admin_password="admin" \
+            --admin_email="admin@example.com" \
+            --allow-root \
+            --path=/var/www/html
+
+          echo ""
+          echo "=== WordPress Installation Complete ==="
+          wp core version --allow-root
+          echo "PHP: $($PHP_BIN -r 'echo PHP_VERSION;')"
+          echo "DB: mysql -u admin -padmin wordpress"
+
+          # Fix permissions
+          chown -R www-data:www-data /var/www/html
+
+      # -- Configure PHP-FPM --
+      - name: Configure PHP-FPM pool
+        run: |
+          set -euxo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          POOL="/etc/php/${SERIES}/fpm/pool.d/www.conf"
+
+          if [ -f "$POOL" ]; then
+            sed -i "s|^listen = .*|listen = /run/php/php${SERIES}-fpm.sock|" "$POOL"
+            sed -i 's|^;listen.mode = .*|listen.mode = 0666|' "$POOL"
+            sed -i "s|^;php_admin_value\[error_log\] = .*|php_admin_value[error_log] = /var/log/php${SERIES}-fpm-audit.log|" "$POOL"
+            sed -i 's|^;php_admin_flag\[log_errors\] = .*|php_admin_flag[log_errors] = on|' "$POOL"
+            sed -i 's|^php_admin_value\[error_reporting\] = .*|php_admin_value[error_reporting] = E_ALL|' "$POOL"
+            echo "FPM pool configured: $POOL"
+          else
+            echo "::error::FPM pool config not found at $POOL"
+            exit 1
+          fi
+          mkdir -p /run/php
+
+      # -- Start PHP-FPM --
+      - name: Start PHP-FPM
+        run: |
+          set -euxo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          php-fpm${SERIES} --daemonize 2>/tmp/fpm-audit-start.log || {
+            echo "::error::PHP-FPM failed to start"
+            cat /tmp/fpm-audit-start.log
+            exit 1
+          }
+          sleep 2
+          [ -S "/run/php/php${SERIES}-fpm.sock" ] || {
+            echo "::error::FPM socket not created"
+            cat /tmp/fpm-audit-start.log
+            exit 1
+          }
+          echo "PHP-FPM started, socket OK"
+
+      # ==================================================================
+      # TEST 01: PHP Syntax Check
+      # ==================================================================
+      - name: "Test 01: PHP Syntax Check (all WP files)"
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/01-syntax-check.sh
+          e2e-tests/01-syntax-check.sh /var/www/html "/usr/bin/php${SERIES}" e2e-tests/logs-audit "$METADATA" || true
+
+      # ==================================================================
+      # TEST 02: Deprecation Detection
+      # ==================================================================
+      - name: "Test 02: Deprecation and Removal Detection"
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/02-deprecation-check.sh
+          e2e-tests/02-deprecation-check.sh /var/www/html "/usr/bin/php${SERIES}" e2e-tests/logs-audit "$METADATA" || true
+
+      # ==================================================================
+      # TEST 04: Nginx + FPM + LIVE WordPress Integration
+      # ==================================================================
+      - name: "Test 04: Nginx + PHP-FPM + Live WordPress"
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/04-nginx-fpm-test.sh
+          e2e-tests/04-nginx-fpm-test.sh /var/www/html "$SERIES" e2e-tests/logs-audit "$METADATA" || true
+
+      # ==================================================================
+      # TEST 05: Direct FPM Socket Test
+      # ==================================================================
+      - name: "Test 05: Direct FPM Socket Test (no web server)"
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/05-fpm-socket-direct.sh
+          e2e-tests/05-fpm-socket-direct.sh "$SERIES" e2e-tests/logs-audit "$METADATA" || true
+
+      # ==================================================================
+      # TEST 06: Before/After Migration Analysis
+      # ==================================================================
+      - name: "Test 06: Before/After PHP Migration Analysis"
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/06-before-after-migration.sh
+          e2e-tests/06-before-after-migration.sh /var/www/html "/usr/bin/php${SERIES}" e2e-tests/logs-audit "$METADATA" || true
+
+      # ==================================================================
+      # Runtime Error Collection
+      # ==================================================================
+      - name: "Collect Runtime Errors from FPM Log"
+        if: always()
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+          METADATA=$(printf '{"release":"%s","php":"%s","os":"Ubuntu 22.04","date":"%s"}' "$TAG" "$PHP_VER" "$(date -u +%Y-%m-%d)")
+          chmod +x e2e-tests/03-runtime-error-check.sh
+          e2e-tests/03-runtime-error-check.sh "http://localhost:8080" "$SERIES" e2e-tests/logs-audit "$METADATA" || true
+
+      # -- Generate summary --
+      - name: Generate audit summary
+        if: always()
+        run: |
+          set -euo pipefail
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          PHP_VER=$(/usr/bin/php${SERIES} -r 'echo PHP_VERSION;')
+
+          echo ""
+          echo "=============================================="
+          echo " E2E WordPress Audit Summary"
+          echo "=============================================="
+          echo " Release:  $TAG"
+          echo " PHP:      $PHP_VER"
+          echo " OS:       Ubuntu 22.04"
+          echo " Date:     $(date -u +%Y-%m-%d)"
+          echo " DB:       MariaDB (admin/admin @ localhost)"
+          echo " WP:       Fully installed via WP-CLI"
+          echo "=============================================="
+          echo ""
+
+          echo "--- Audit Log Files ---"
+          ls -la e2e-tests/logs-audit/*.md 2>/dev/null || echo "No log files generated"
+          echo ""
+
+          echo "--- Key Findings ---"
+          PASS_COUNT=0
+          FAIL_COUNT=0
+          for f in e2e-tests/logs-audit/*_0[1-6]-*.md; do
+            [ -f "$f" ] || continue
+            RESULT=$(grep -E '^RESULT:' "$f" 2>/dev/null | tail -1 || true)
+            if [ -n "$RESULT" ]; then
+              BN=$(basename "$f")
+              if echo "$RESULT" | grep -qE '_FAILS=[1-9]|FATAL_ERRORS|_FAILED|INTEGRATION_TEST_FAILS'; then
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo "  ❌ $BN"
+                echo "     $RESULT"
+              else
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo "  ✅ $BN"
+                echo "     $RESULT"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "=============================================="
+          echo " Total: $((PASS_COUNT + FAIL_COUNT)) test suites, $PASS_COUNT passed, $FAIL_COUNT failed"
+          echo "=============================================="
+
+      # -- Upload audit logs --
+      - name: Upload audit logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-audit-logs-${{ needs.resolve.outputs.release_tag }}
+          path: e2e-tests/logs-audit/
+          retention-days: 30
+
+      # -- Commit audit logs via GitHub API (always runs, checks for real failures inside) --
+      - name: Commit audit logs on failure
+        if: always() && inputs.commit_logs_on_failure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          SERIES="${{ needs.resolve.outputs.php_series }}"
+          REPO="${{ github.repository }}"
+          DATE=$(date -u +%Y-%m-%d)
+          LOG_DIR="e2e-tests/logs-audit"
+
+          echo "Committing audit logs for $TAG ($DATE)..."
+
+          # Collect all .md log files
+          MD_FILES=()
+          for f in $LOG_DIR/*_0[1-6]-*.md; do
+            [ -f "$f" ] && MD_FILES+=("$f")
+          done
+
+          if [ ${#MD_FILES[@]} -eq 0 ]; then
+            echo "No log files to commit"
+            exit 0
+          fi
+
+          echo "Found ${#MD_FILES[@]} log files to commit"
+
+          # Step 1: Get current main branch SHA
+          MAIN_SHA=$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha' 2>&1) || {
+            echo "Failed to get main SHA: $MAIN_SHA"
+            exit 0
+          }
+          echo "Base SHA: $MAIN_SHA"
+
+          # Step 1b: Get tree SHA from the commit (Git API requires tree SHA, not commit SHA)
+          MAIN_TREE_SHA=$(gh api "repos/$REPO/git/commits/${MAIN_SHA}" --jq '.tree.sha' 2>&1) || {
+            echo "Failed to get tree SHA for commit $MAIN_SHA: $MAIN_TREE_SHA"
+            exit 0
+          }
+          echo "Base tree SHA: $MAIN_TREE_SHA"
+
+          # Step 2: Build tree entries (create blobs for each file)
+          TREE_ITEMS="[]"
+          for f in "${MD_FILES[@]}"; do
+            FILENAME=$(basename "$f")
+            FILE_PATH="e2e-tests/logs-audit/${TAG}/${DATE}/${FILENAME}"
+            FILE_B64=$(base64 -w0 "$f")
+
+            BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
+              --input - \
+              --jq '.sha' <<< "{\"encoding\":\"base64\",\"content\":\"${FILE_B64}\"}" 2>&1) || {
+              echo "Warning: failed to create blob for $FILENAME"
+              continue
+            }
+            echo "  Blob $FILENAME -> $BLOB_SHA"
+            TREE_ITEMS=$(echo "$TREE_ITEMS" | jq --arg path "$FILE_PATH" --arg sha "$BLOB_SHA" \
+              '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
+          done
+
+          # Step 3: Create tree (use commit tree SHA as base_tree)
+          TREE_SHA=$(gh api "repos/$REPO/git/trees" \
+            --input - \
+            --jq '.sha' <<< "{\"base_tree\":\"${MAIN_TREE_SHA}\",\"tree\":${TREE_ITEMS}}" 2>&1) || {
+            echo "Failed to create tree: $TREE_SHA"
+            exit 0
+          }
+          echo "Tree SHA: $TREE_SHA"
+
+          # Step 4: Create commit (single-line message to avoid YAML indent issues)
+          COMMIT_MSG="audit: add e2e test logs for ${TAG} (${DATE}) — PHP ${SERIES} build"
+
+          COMMIT_SHA=$(gh api "repos/$REPO/git/commits" \
+            --input - \
+            --jq '.sha' <<< "{\"message\":$(echo "$COMMIT_MSG" | jq -Rs .),\"tree\":\"${TREE_SHA}\",\"parents\":[\"${MAIN_SHA}\"]}" 2>&1) || {
+            echo "Failed to create commit: $COMMIT_SHA"
+            exit 0
+          }
+          echo "Commit SHA: $COMMIT_SHA"
+
+          # Step 5: Update main ref
+          gh api "repos/$REPO/git/refs/heads/main" \
+            --input - \
+            -X PATCH <<< "{\"sha\":\"${COMMIT_SHA}\"}" 2>&1 && \
+            echo "Audit logs pushed to main" || \
+            echo "Warning: failed to update main ref"

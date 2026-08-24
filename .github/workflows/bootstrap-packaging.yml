@@ -1,0 +1,108 @@
+name: Bootstrap packaging (run once, not per-build)
+
+# ============================================================================
+# RUN THIS RARELY. Not for every beta/RC -- only when:
+#   - You're setting this repo up for the first time, or
+#   - You deliberately want to re-sync from a newer Debian base later
+#     (e.g. once Debian actually starts packaging 8.6, or a later series
+#     fixed something you want).
+#
+# WHAT IT DOES AND WHY
+# ----------------------------------------------------------------------------
+# Clones the last RELEASED PHP series' real Debian packaging (debian/
+# directory) from salsa.debian.org, mechanically rewrites the base
+# series -> target series in it, and commits the RESULT directly into
+# THIS repo, at packaging/debian/. From that point on, packaging/debian/
+# already says the target series everywhere -- it's yours, tracked in git.
+#
+# The day-to-day build-php.yml workflow never talks to salsa.debian.org
+# and never sees the base series -- it just uses packaging/debian/ as-is.
+# This mirrors how Sury and Remi Collet actually work: each maintains ONE
+# persistent, version-baked packaging/spec tree in git and evolves it
+# release to release (see Remi's own changelog: 8.4.0~beta1 in Aug 2024
+# through 8.6.0~beta1 in Aug 2026 is one continuous lineage of edits to
+# the same file, not a fresh derivation from a different version each
+# time). If a later beta needs a packaging fix, you edit packaging/debian/
+# directly in this repo and commit it -- same as Remi's changelog entries
+# like "fix build on EL-8 using patch from https://...".
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_series:
+        description: "Last RELEASED PHP series to copy Debian packaging from"
+        type: string
+        default: "8.5"
+      target_series:
+        description: "PHP series you're packaging"
+        type: string
+        default: "8.6"
+      commit_branch:
+        description: "Branch to push the result to -- review the diff before merging to main"
+        type: string
+        default: "packaging-bootstrap"
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Find the Debian packaging branch for base_series
+        id: find
+        run: |
+          set -euo pipefail
+          REPO="https://salsa.debian.org/php-team/php.git"
+          for CANDIDATE in "debian/main/${{ inputs.base_series }}" "master-${{ inputs.base_series }}"; do
+            if git ls-remote --exit-code --heads "$REPO" "$CANDIDATE" | grep -q "$CANDIDATE"; then
+              echo "Found: $CANDIDATE"
+              echo "base_branch=$CANDIDATE" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::error::No branch for series ${{ inputs.base_series }} found in $REPO."
+          git ls-remote --heads "$REPO"
+          exit 1
+
+      - name: Clone base packaging
+        run: |
+          set -eux
+          git clone --single-branch --branch "${{ steps.find.outputs.base_branch }}" --depth 1 \
+            https://salsa.debian.org/php-team/php.git base-pkg
+          test -d base-pkg/debian || { echo "::error::no debian/ in base-pkg"; exit 1; }
+
+      - name: Port ${{ inputs.base_series }} -> ${{ inputs.target_series }} and adopt into this repo
+        run: |
+          set -eux
+          BASE="${{ inputs.base_series }}"
+          TARGET="${{ inputs.target_series }}"
+          cd base-pkg
+          find debian -depth -name "*${BASE}*" | while read -r f; do
+            new="$(echo "$f" | sed "s/${BASE}/${TARGET}/g")"
+            mkdir -p "$(dirname "$new")"
+            mv "$f" "$new"
+          done
+          grep -rl "${BASE}" debian/ | xargs -r sed -i "s/${BASE}/${TARGET}/g"
+          echo "== Resulting binary package list =="
+          grep -E '^Package:' debian/control || { echo "::error::no Package: stanzas after rewrite"; exit 1; }
+          cd ..
+          rm -rf packaging/debian
+          mkdir -p packaging
+          mv base-pkg/debian packaging/debian
+          rm -rf base-pkg
+
+      - name: Commit adopted packaging to ${{ inputs.commit_branch }}
+        run: |
+          set -eux
+          git config user.email "markusfoo@users.noreply.github.com"
+          git config user.name "markusfoo"
+          git checkout -B "${{ inputs.commit_branch }}"
+          git add packaging/debian
+          git commit -m "Adopt php${{ inputs.target_series }} packaging from ${{ steps.find.outputs.base_branch }}" || echo "Nothing changed"
+          git push -f origin "${{ inputs.commit_branch }}"
+          echo "Now open a PR from ${{ inputs.commit_branch }} into main, review the diff, and merge it."
+          echo "After that, build-php.yml never needs base_series again."

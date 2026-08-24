@@ -1,0 +1,19 @@
+php8.6 (8.6.6-2) experimental; urgency=medium
+
+  * The systemd unit file has been hardened.  Extra options from
+    sapi/fpm/php-fpm.service.in has been used:
+
+    ProtectSystem=full
+    PrivateDevices=true
+    ProtectKernelModules=true
+    ProtectKernelTunables=true
+    ProtectControlGroups=true
+    RestrictRealtime=true
+    RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+    RestrictNamespaces=true
+
+    This should work in the default environments, but you might need
+    to modify the systemd unit file if you are using less standard
+    FPM configuration.
+
+ -- Ondřej Surý <ondrej@debian.org>  Sun, 10 May 2026 19:35:30 +0200

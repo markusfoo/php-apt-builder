@@ -1,0 +1,254 @@
+name: PECL Extension Compatibility Checker
+
+# ==========================================================================
+# FAST extension checker -- does NOT rebuild PHP from source.
+#
+# Downloads the .deb packages from the latest GitHub Release, installs them,
+# then tries to compile each PECL extension against the installed PHP 8.6.
+# Completes in ~2 minutes instead of the ~50-minute full build.
+#
+# Use this to:
+#   1. Discover which extensions compile (and which need patches)
+#   2. See the EXACT compiler errors for each failing extension
+#   3. Iterate on patches quickly, then promote to the main workflow
+# ==========================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_tag:
+        description: 'Release tag to download PHP debs from'
+        type: string
+        default: 'php8.6.0-beta1-1'
+      extensions:
+        description: 'Space-separated list of PECL extensions to test'
+        type: string
+        default: 'xdebug redis igbinary msgpack apcu mongodb imagick memcached'
+
+permissions:
+  contents: read
+
+jobs:
+  check-extensions:
+    name: Test PECL extensions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v7
+
+      # ----------------------------------------------------------------
+      # Download the pre-built PHP 8.6 .deb files from the existing release
+      # ----------------------------------------------------------------
+      - name: Download PHP .deb files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p php-debs
+          gh release download '${{ inputs.php_tag }}' \
+            --repo '${{ github.repository }}' \
+            --pattern '*.deb' \
+            --dir php-debs/ || true
+          echo "Downloaded $(ls php-debs/*.deb 2>/dev/null | wc -l) .deb files"
+          ls -lh php-debs/
+
+      # ----------------------------------------------------------------
+      # Install PHP 8.6 + build dependencies
+      # ----------------------------------------------------------------
+      - name: Install PHP 8.6 and PECL build deps
+        run: |
+          set -eo pipefail
+
+          # CI reliability
+          sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/azure-cli.list
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+
+          # Add packages.sury.org/php (for build-libs on jammy)
+          curl -fsSL https://packages.sury.org/php/apt.gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | sudo tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then break; fi
+            sleep 5
+          done
+
+          # Install PECL build tools + extension-specific system libs
+          sudo apt-get install -y --no-install-recommends \
+            checkinstall php-pear php8.5-dev build-essential \
+            libmagickwand-dev libmemcached-dev zlib1g-dev libssl-dev libsasl2-dev
+
+          # Install our PHP 8.6 debs
+          sudo dpkg -i php-debs/*.deb 2>/dev/null || true
+          sudo apt-get install -f -y
+
+          echo "=== PHP 8.6 installed ==="
+          php8.6 -v
+          php8.6 -m | head -20 || true
+
+      # ----------------------------------------------------------------
+      # Test each extension
+      # ----------------------------------------------------------------
+      - name: Test PECL extensions
+        run: |
+          set -uo pipefail
+
+          EXTENSIONS="${{ inputs.extensions }}"
+          SERIES="8.6"
+          RESULTS_DIR="$PWD/check-results"
+          mkdir -p "$RESULTS_DIR"
+
+          PASS=0
+          FAIL=0
+          SKIP=0
+
+          for EXT in $EXTENSIONS; do
+            echo "::group::$EXT"
+            echo ""
+            WORK=$(mktemp -d)
+            cd "$WORK"
+
+            # --- clone from official GitHub (not PECL) ---
+            REPO_URL=""
+            case "$EXT" in
+              xdebug)    REPO_URL="https://github.com/xdebug/xdebug.git" ;;
+              redis)     REPO_URL="https://github.com/phpredis/phpredis.git" ;;
+              igbinary)  REPO_URL="https://github.com/igbinary/igbinary.git" ;;
+              msgpack)   REPO_URL="https://github.com/msgpack/msgpack-php.git" ;;
+              apcu)      REPO_URL="https://github.com/krakjoe/apcu.git" ;;
+              mongodb)   REPO_URL="https://github.com/mongodb/mongo-php-driver.git" ;;
+              imagick)   REPO_URL="https://github.com/Imagick/imagick.git" ;;
+              memcached) REPO_URL="https://github.com/php-memcached-dev/php-memcached.git" ;;
+              *)
+                echo "::warning::Unknown extension: $EXT (no git repo mapping)"
+                rm -rf "$WORK"; echo "::endgroup::"; continue
+                ;;
+            esac
+
+            echo "Cloning $REPO_URL ..."
+            CLONE_OPTS="--depth 1 --tags"
+            [ "$EXT" = "mongodb" ] && CLONE_OPTS="--depth 1 --tags --recurse-submodules --shallow-submodules"
+            if ! timeout 120 git clone $CLONE_OPTS "$REPO_URL" src 2>&1; then
+              echo "::warning::git clone failed for $EXT"
+              SKIP=$((SKIP+1))
+              echo "SKIP" > "$RESULTS_DIR/$EXT.result"
+              rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+            cd src
+
+            # --- version from package source (not git tags) ---
+            EXT_VER=""
+            if [ -f package.xml ]; then
+              EXT_VER=$(grep -oP '<release>\K[^<]+' package.xml | head -1) || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              HEADER=$(find . -maxdepth 2 -name 'php_*.h' | head -1)
+              [ -n "$HEADER" ] && EXT_VER=$(grep -oP 'PHP_\w+_VERSION\s+"?\K[^"]+' "$HEADER" | head -1) || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              EXT_VER=$(git describe --tags 2>/dev/null | sed 's/^v//') || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              EXT_VER=$(git rev-parse --short HEAD)
+            fi
+            echo "Version: $EXT_VER"
+
+            # --- apply PHP 8.6 compatibility patches ---
+            case "$EXT" in
+              imagick)
+                if [ -f imagick_class.c ]; then
+                  sed -i 's/zend_is_callable(user_callback, 0, NULL TSRMLS_CC)/zend_is_callable_ex(user_callback, NULL, 0, NULL, NULL, NULL)/g' imagick_class.c
+                  echo "  [PATCH] Applied zend_is_callable_ex patch"
+                fi
+                ;;
+              msgpack)
+                # PHP 8.6: PG(unserialize_callback_func) changed from char* to zend_string*
+                if [ -f msgpack_unpack.c ]; then
+                  sed -i 's/PG(unserialize_callback_func)\[0\] == .\\0./ZSTR_LEN(PG(unserialize_callback_func)) == 0/g' msgpack_unpack.c
+                  echo "  [PATCH] Applied PG(unserialize_callback_func) zend_string patch"
+                fi
+                if [ -f msgpack_class.c ]; then
+                  # Same pattern may exist in class file
+                  sed -i 's/PG(unserialize_callback_func)\[0\] == .\\0./ZSTR_LEN(PG(unserialize_callback_func)) == 0/g' msgpack_class.c
+                fi
+                ;;
+            esac
+
+            # --- phpize ---
+            PHPIZE="phpize${SERIES}"
+            PCONF="/usr/bin/php-config${SERIES}"
+            [ ! -x "$PCONF" ] && PCONF="/usr/bin/php-config"
+
+            echo "--- phpize ---"
+            if ! "$PHPIZE" 2>&1; then
+              echo "FAIL: phpize" > "$RESULTS_DIR/$EXT.result"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- configure ---
+            CONF_EXTRA=""
+            case "$EXT" in
+              imagick)   CONF_EXTRA="--with-imagick" ;;
+              memcached) CONF_EXTRA="--with-libmemcached-dir=/usr --disable-memcached-sasl" ;;
+            esac
+
+            echo "--- configure $CONF_EXTRA ---"
+            if ! ./configure --with-php-config="$PCONF" $CONF_EXTRA 2>&1; then
+              echo "FAIL: configure" > "$RESULTS_DIR/$EXT.result"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- make ---
+            echo "--- make -j$(nproc) ---"
+            if ! make -j"$(nproc)" 2>&1; then
+              echo "FAIL: make" > "$RESULTS_DIR/$EXT.result"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- success ---
+            echo "PASS" > "$RESULTS_DIR/$EXT.result"
+            PASS=$((PASS+1))
+            echo "  ✓ $EXT $EXT_VER compiles successfully!"
+
+            cd /
+            rm -rf "$WORK"
+            echo "::endgroup::"
+          done
+
+          # --- summary ---
+          echo ""
+          echo "============================================"
+          echo "  EXTENSION CHECKER RESULTS"
+          echo "============================================"
+          for EXT in $EXTENSIONS; do
+            if [ -f "$RESULTS_DIR/$EXT.result" ]; then
+              STATUS=$(cat "$RESULTS_DIR/$EXT.result")
+              case "$STATUS" in
+                PASS) echo "  ✅ $EXT -- compiles" ;;
+                FAIL) echo "  ❌ $EXT -- $STATUS (see log above for errors)" ;;
+                SKIP) echo "  ⏭️  $EXT -- skipped" ;;
+              esac
+            fi
+          done
+          echo "============================================"
+          echo "  Passed: $PASS  |  Failed: $FAIL  |  Skipped: $SKIP"
+          echo "============================================"
+          echo ""
+
+          # Fail the step only if ALL extensions failed (at least one success = progress)
+          if [ "$PASS" -eq 0 ] && [ "$FAIL" -gt 0 ]; then
+            echo "::error::All extensions failed to compile"
+            exit 1
+          fi

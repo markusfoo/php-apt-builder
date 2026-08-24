@@ -1,0 +1,11 @@
+[Unit]
+Description=The PHP @PHP_VERSION@ LiteSpeed
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lsphp@PHP_VERSION@ -b /run/php/lsphp@PHP_VERSION@.sock
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

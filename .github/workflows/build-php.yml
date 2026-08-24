@@ -1,0 +1,1419 @@
+name: Build PHP Packages (Ubuntu 22.04 / jammy)
+
+# ============================================================================
+# DAY-TO-DAY BUILD. Run this every time a new beta/RC drops.
+#
+# Unlike an earlier version of this pipeline, this workflow never fetches
+# or renames anything from Debian's 8.5 packaging, and never mentions
+# "8.5". It uses packaging/debian/ as committed in THIS repo (produced
+# once by bootstrap-packaging.yml -- see that file's header for why).
+# packaging/debian/ already says "php8.6" everywhere; this workflow only
+# ever bumps its changelog entry for the new tag being built.
+#
+# NOTHING HERE TOUCHES YOUR SERVER. Every job runs on GitHub's own
+# disposable machines. Your Hestia box is only touched when YOU run
+# `apt install` / `apt upgrade` against the repo this produces -- a
+# separate, manual, later decision made after you've seen smoke-test pass.
+#
+# If a new beta needs a packaging change Debian's 8.5-derived tree didn't
+# anticipate (new build-dep, renamed extension, changed rules logic), fix
+# it directly in packaging/debian/ in this repo and commit it -- that fix
+# is then permanent for every future run, the same way Remi Collet's own
+# changelog shows him landing one-off upstream-PR fixes into his spec file
+# release to release.
+#
+# ----------------------------------------------------------------------------
+# RELIABILITY HARDENING (added after run #3 died as `cancelled` at exactly
+# 6h 0m -- GitHub's default hard job timeout -- while stuck inside a plain
+# `apt-get update`):
+#
+#   1. Every job now has an explicit `timeout-minutes`, so a hung step fails
+#      fast (minutes, not 6 hours of burned runner time) with a clear log.
+#   2. Every job that touches apt drops a persistent apt.conf.d file first,
+#      giving Acquire::Retries / Acquire::*::Timeout / ForceIPv4 to every
+#      apt call in that job -- including ones you don't call directly, like
+#      the apt-get invoked internally by mk-build-deps.
+#   3. The specific calls most likely to sit on a dead TCP connection
+#      (apt-get update, git clone) are additionally
+#      wrapped in their own `timeout` + small retry loop, as a second line
+#      of defense on top of #2.
+#   4. Unneeded third-party apt sources preinstalled on GitHub's runner
+#      image (google-chrome, azure-cli) are stripped before `apt-get
+#      update`, since they are not needed to build PHP and only add extra
+#      mirrors that can stall the update.
+#   5. `DEBIAN_FRONTEND=noninteractive` is set workflow-wide so no dpkg/
+#      debconf prompt can ever silently block a headless runner.
+#   6. A `concurrency` group cancels a stale/stuck run automatically the
+#      moment you re-dispatch for the same tag, instead of requiring you to
+#      cancel it by hand first.
+#
+# PECL EXTENSIONS (Job 5 - build-pecl):
+#   After the PHP packages are compiled, the pipeline automatically builds
+#   8 common PECL extensions (xdebug, redis, igbinary, msgpack, apcu,
+#   mongodb, imagick, memcached) against the just-built PHP.
+#   Source is cloned from official GitHub repos (not pecl download).
+#   PHP compatibility patches are applied automatically.
+#   Extensions that fail to compile are skipped with a warning.
+#   To change the list, edit the EXTENSIONS variable in the build-pecl job.
+#
+# SMART RELEASE MANAGEMENT (Job 6 - publish):
+#   If a GitHub Release for this version tag already exists, new .deb files
+#   are UPLOADED to it (existing assets are never deleted).  The release
+#   description is automatically updated with a dated entry listing any
+#   newly added PECL extensions.  If no release exists, a new one is created
+#   with full metadata and a PECL extensions table.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_tag:
+        description: "Git tag in php/php-src to build"
+        type: string
+        default: "php-8.6.0beta1"
+      target_series:
+        description: "PHP series -- must match packaging/debian/ (phpX.Y-*)"
+        type: string
+        default: "8.6"
+      pkg_upstream_version:
+        description: "Debian-ordered upstream version string (~ sorts before nothing, so ~beta1 < final)"
+        type: string
+        default: "8.6.0~beta1"
+      pkg_revision:
+        description: "Debian package revision suffix"
+        type: string
+        default: "1"
+      publish:
+        description: "Create a GitHub Release with .deb packages if build + smoke-test pass"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+# Re-dispatching for the same tag/series cancels any run already stuck on
+# it, instead of leaving a hung run to burn hours in parallel with the fix.
+concurrency:
+  group: build-php-${{ github.event.inputs.target_series }}-${{ github.event.inputs.php_tag }}
+  cancel-in-progress: true
+
+env:
+  DISTRO_CODENAME: jammy   # hardcoded: the only target your Hestia server needs
+  PKG: php${{ inputs.target_series }}
+  DEBIAN_FRONTEND: noninteractive   # never let a dpkg/debconf prompt block a headless runner
+
+jobs:
+
+  # ==========================================================================
+  # JOB 1 -- verify the php-src tag exists, and that packaging/debian/ in
+  # this repo actually matches target_series, before doing anything else.
+  # ==========================================================================
+  resolve:
+    name: Resolve inputs
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Confirm php_tag exists in php/php-src
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if timeout 30 git ls-remote --exit-code --tags https://github.com/php/php-src.git "refs/tags/${{ inputs.php_tag }}" >/dev/null; then
+              exit 0
+            fi
+            echo "::warning::git ls-remote attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::Tag '${{ inputs.php_tag }}' not found in php/php-src (or GitHub was unreachable after 3 attempts)."
+          exit 1
+
+      - name: Confirm packaging/debian/ exists and matches target_series
+        run: |
+          set -euxo pipefail
+          test -d packaging/debian || {
+            echo "::error::packaging/debian/ not found. Run bootstrap-packaging.yml once first (see its header comment)."
+            exit 1
+          }
+          if ! grep -q "^Package: ${PKG}-" packaging/debian/control; then
+            echo "::error::packaging/debian/control has no ${PKG}-* packages. Wrong target_series, or bootstrap wasn't run/merged for this series."
+            grep '^Package:' packaging/debian/control || true
+            exit 1
+          fi
+          echo "OK: packaging/debian/ matches ${PKG}."
+
+  # ==========================================================================
+  # JOB 2 -- assemble the source tree, bump changelog, validate WITHOUT
+  # compiling anything.
+  # ==========================================================================
+  prepare-and-validate:
+    name: Assemble + validate
+    needs: resolve
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure apt for CI reliability (retries, timeouts, IPv4-only)
+        run: |
+          set -euxo pipefail
+          sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+          # Drop preinstalled third-party sources we don't need for a PHP
+          # build -- fewer mirrors to query means fewer chances to stall.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          # Bypass the Azure regional package mirror. GitHub's ubuntu-22.04
+          # image resolves the main Ubuntu archive via
+          # mirror+file:/etc/apt/apt-mirrors.txt, which tries
+          # azure.archive.ubuntu.com first. That mirror is currently
+          # slow/unresponsive, so apt-get update stalls past our 60s
+          # per-attempt timeout before it ever falls back to the working
+          # archive.ubuntu.com host. Point the mirrorlist straight at the
+          # canonical archive to skip the stall entirely.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+
+      - name: Install packaging toolchain
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed after 3 attempts."; exit 1; }
+          done
+          sudo apt-get install -y --no-install-recommends \
+            build-essential devscripts debhelper dpkg-dev equivs quilt \
+            git-buildpackage lintian pkg-php-tools re2c bison autoconf ca-certificates
+
+      # Debian's php-team packaging is usually cut against a newer Debian
+      # archive than jammy's 2022-era repos ship. packages.sury.org/php is the
+      # same PPA already running php8.5 on your server -- it backports the
+      # library versions PHP's build needs, for jammy specifically.
+      - name: Add packages.sury.org/php (backported build-libs for jammy)
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://packages.sury.org/php/apt.gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | sudo tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update (post-PPA) attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update (post-PPA) failed after 3 attempts."; exit 1; }
+          done
+
+      - name: Fetch PHP upstream source and build orig tarball
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2; do
+            if timeout 300 git clone --branch "${{ inputs.php_tag }}" --depth 1 https://github.com/php/php-src.git src; then
+              break
+            fi
+            echo "::warning::git clone attempt ${attempt} failed or hung, retrying in 5s..."
+            rm -rf src
+            sleep 5
+            [ "$attempt" -eq 2 ] && { echo "::error::git clone of php-src failed after 2 attempts."; exit 1; }
+          done
+          rm -rf src/.git
+          ORIG_DIR="${PKG}-${{ inputs.pkg_upstream_version }}"
+          mv src "$ORIG_DIR"
+          tar --sort=name --owner=0 --group=0 -cJf "${PKG}_${{ inputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR"
+          mkdir -p build-area
+          mv "${PKG}_${{ inputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR" build-area/
+          cp -r packaging/debian "build-area/${ORIG_DIR}/debian"
+
+      - name: Add changelog entry for this build
+        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        run: |
+          set -euxo pipefail
+          export DEBEMAIL="ci@example.com"
+          export DEBFULLNAME="Custom PHP CI"
+          dch -b --package "$PKG" \
+              --newversion "${{ inputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}" \
+              --distribution "$DISTRO_CODENAME" --force-distribution \
+              "Build of ${{ inputs.php_tag }}."
+
+      # ---- validation stage: catch problems in seconds, not after a 20-40 min compile ----
+      - name: Validate build-dependencies resolve
+        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        run: timeout 120 sudo apt-get build-dep --simulate .
+
+      - name: Validate source package structure
+        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        run: dpkg-source -b .
+
+      - name: Lint the packaging
+        working-directory: build-area
+        run: |
+          set -euxo pipefail
+          # lintian's flag names have shifted across versions -- if this
+          # syntax is stale on the runner's installed lintian, check the
+          # log; intent is "fail on real errors, allow warnings through".
+          lintian --fail-on error ./*.dsc
+
+      - name: Upload prepared + validated source tree
+        uses: actions/upload-artifact@v7
+        with:
+          name: prepared-source
+          path: build-area
+          if-no-files-found: error
+          include-hidden-files: true
+
+  # ==========================================================================
+  # JOB 3 -- only runs if validation passed. Actually compiles.
+  # ==========================================================================
+  build:
+    name: Compile .deb packages
+    needs: prepare-and-validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Download prepared source
+        uses: actions/download-artifact@v7
+        with:
+          name: prepared-source
+          path: build-area
+
+      # actions/upload-artifact -> download-artifact does NOT preserve
+      # Unix file permissions (the zip format has no mandatory +x bit).
+      # buildconf, configure, debian/rules etc. all lose +x, causing
+      # "Permission denied" (exit 126) during dpkg-buildpackage.
+      - name: Restore executable permissions lost during artifact round-trip
+        run: |
+          set -euxo pipefail
+          find build-area -type f \( \
+            -name 'buildconf' -o \
+            -name 'configure' -o \
+            -name 'install-sh' -o \
+            -name 'mkinstalldirs' -o \
+            -name 'libtool' -o \
+            -name 'ltmain.sh' -o \
+            -name '*.sh' -o \
+            -name 'run-tests.php' -o \
+            -name 'shtool' -o \
+            -name 'config-stubs' -o \
+            -name 'gen_stub.php' -o \
+            -name 'debian/rules' \
+          \) -exec chmod +x {} +
+          echo "Restored +x on critical build scripts:"
+          find build-area -name 'buildconf' -ls || true
+          find build-area -name 'debian/rules' -ls || true
+
+      - name: Configure apt for CI reliability (retries, timeouts, IPv4-only)
+        run: |
+          set -euxo pipefail
+          sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          # Bypass the flaky azure.archive.ubuntu.com mirror -- see comment
+          # in the earlier "Configure apt for CI reliability" step.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+
+      - name: Install build toolchain
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed after 3 attempts."; exit 1; }
+          done
+          sudo apt-get install -y --no-install-recommends \
+            build-essential devscripts debhelper dpkg-dev equivs fakeroot pkg-php-tools re2c bison autoconf
+
+      # The greedy '%:' catch-all rule in debian/rules matches
+      # /usr/lib/php/php-common.mk (included via -include) as a make
+      # target, causing "dh: error: Unknown sequence" because $@
+      # expands to the file path instead of binary/clean/etc.
+      # Add an explicit no-op guard rule so make never reaches %:
+      # for that path.
+      - name: Fix dh Unknown sequence error in debian/rules
+        run: |
+          set -euxo pipefail
+          for rules in build-area/*/debian/rules; do
+            if [ -f "$rules" ] && grep -q '^%:' "$rules"; then
+              sed -i '/^%:/i /usr/lib/php/php-common.mk: ;' "$rules"
+              echo "Patched: $rules - added guard rule for php-common.mk"
+            fi
+          done
+
+      - name: Add packages.sury.org/php
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://packages.sury.org/php/apt.gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | sudo tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update (post-PPA) attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update (post-PPA) failed after 3 attempts."; exit 1; }
+          done
+
+      # mk-build-deps / dpkg-buildpackage call apt-get internally; they
+      # automatically inherit the Acquire::Retries/Timeout/ForceIPv4
+      # settings dropped into /etc/apt/apt.conf.d above, so no extra flags
+      # are needed here. Compilation itself is intentionally NOT wrapped in
+      # a short `timeout` -- it can legitimately run long; the job-level
+      # `timeout-minutes: 120` above is the outer safety net for it.
+      - name: Install real build-dependencies and compile
+        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        run: |
+          set -euxo pipefail
+          sudo mk-build-deps -ir -t "apt-get -y --no-install-recommends" debian/control
+          dpkg-buildpackage -us -uc -b -j"$(nproc)"
+
+      - name: Collect built .deb files
+        run: |
+          set -euxo pipefail
+          mkdir -p debs
+          find build-area -maxdepth 1 -name '*.deb' -exec mv {} debs/ \;
+          echo "Built $(ls -1 debs/*.deb | wc -l) package(s):"
+          ls -lh debs/
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: php-debs
+          path: debs/*.deb
+          if-no-files-found: error
+          include-hidden-files: true
+
+  # ==========================================================================
+  # JOB 4 -- only runs if the build succeeded. Proves the packages actually
+  # work, in a fresh disposable container -- never on your server.
+  # ==========================================================================
+  smoke-test:
+    name: Install in a clean container and sanity-check
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    container: ubuntu:22.04
+    # Container jobs default to `sh`, not `bash`, even when the image has
+    # bash installed -- this breaks every `set -euxo pipefail` run step
+    # below (`sh: 1: set: Illegal option -o pipefail`). Force bash
+    # explicitly to match the shell every other job in this workflow gets
+    # for free from runs-on: ubuntu-22.04.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out this repo (for tests/smoke.sh, if you add one)
+        uses: actions/checkout@v7
+
+      - name: Download built .deb files
+        uses: actions/download-artifact@v7
+        with:
+          name: php-debs
+          path: debs
+
+      - name: Configure apt for CI reliability (retries, timeouts, IPv4-only)
+        run: |
+          set -euxo pipefail
+          mkdir -p /etc/apt/apt.conf.d
+          tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+
+      - name: "Add packages.sury.org/php (runtime dependency: php-common)"
+        # This job runs in a bare `ubuntu:22.04` container, not the
+        # GitHub-hosted runner image -- unlike the other two jobs, it has
+        # neither `sudo` (irrelevant, we're already root in the container)
+        # nor `software-properties-common` (which provides
+        # preinstalled. Without packages.sury.org/php here,
+        # apt only sees stock Ubuntu's much older `php-common`, which is
+        # numerically lower than the `php-common (>= 2:95~)` our packages
+        # require -- every php8.6-* package then fails to install with
+        # "Depends: php-common (>= 2:95~) but it is not going to be installed".
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed after 3 attempts."; exit 1; }
+          done
+          apt-get install -y --no-install-recommends gnupg ca-certificates curl
+          curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update (post-PPA) attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update (post-PPA) failed after 3 attempts."; exit 1; }
+          done
+
+      - name: "Add PGDG apt repository (runtime dependency: libpq5 >= 17~)"
+        # The `build` job runs directly on the `ubuntu-22.04` GitHub-hosted
+        # runner, whose image ships a preinstalled, much newer PostgreSQL
+        # client toolchain than what's in Ubuntu jammy's own repos. That's
+        # what php8.6-pgsql actually links against, so dh_shlibdeps records
+        # "Depends: libpq5 (>= 17~)" in the built package.
+        #
+        # This job, in contrast, runs inside a bare `ubuntu:22.04` container,
+        # which only has jammy's stock libpq5 (14.x) -- and packages.sury.org/php
+        # doesn't carry libpq5 either, that's the Postgres team's package,
+        # not the PHP team's. Without the official PGDG apt repo here, apt
+        # can't satisfy that >= 17~ requirement and php8.6-pgsql fails to
+        # install with "Depends: libpq5 (>= 17~~) but it is not going to be
+        # installed".
+        run: |
+          set -euxo pipefail
+          apt-get install -y --no-install-recommends postgresql-common
+          for attempt in 1 2 3; do
+            if timeout 60 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y; then
+              break
+            fi
+            echo "::warning::PGDG repo setup attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::PGDG repo setup failed after 3 attempts."; exit 1; }
+          done
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update (post-PGDG) attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update (post-PGDG) failed after 3 attempts."; exit 1; }
+          done
+
+      - name: Install and run checks
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then
+              break
+            fi
+            echo "::warning::apt-get update attempt ${attempt} failed or hung, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed after 3 attempts."; exit 1; }
+          done
+          apt-get install -y --no-install-recommends ./debs/*.deb || apt-get -f install -y
+          php${{ inputs.target_series }} -v
+          php${{ inputs.target_series }} -m
+          if command -v php${{ inputs.target_series }}-fpm >/dev/null 2>&1; then
+            php${{ inputs.target_series }}-fpm -t
+          fi
+          # Add tests/smoke.sh to this repo to check your own two products
+          # here -- it runs automatically if present, before anything publishes.
+          if [ -x tests/smoke.sh ]; then ./tests/smoke.sh; fi
+
+  # ==========================================================================
+  # JOB 5 -- builds PECL extensions against the just-compiled PHP 8.6.
+  # Runs in parallel with smoke-test (both depend only on the build job).
+  # Extensions that fail to compile (e.g. not yet compatible with 8.6)
+  # are skipped with a warning -- the workflow still succeeds.
+  #
+  # To add/remove extensions, edit the EXTENSIONS list below.
+  # ==========================================================================
+  build-pecl:
+    name: Build PECL extension packages
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Download built PHP .deb files
+        uses: actions/download-artifact@v7
+        with:
+          name: php-debs
+          path: debs
+
+      - name: Configure apt for CI reliability
+        run: |
+          set -euxo pipefail
+          sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+
+      - name: Add repositories and install PHP + PECL build dependencies
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then break; fi
+            echo "::warning::apt-get update attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+          sudo apt-get install -y --no-install-recommends gnupg
+          curl -fsSL https://packages.sury.org/php/apt.gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | sudo tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          for attempt in 1 2 3; do
+            if sudo timeout 60 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y; then break; fi
+            echo "::warning::PGDG setup attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::PGDG setup failed"; exit 1; }
+          done
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then break; fi
+            echo "::warning::apt-get update (post-repo) attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+          # Install the PHP packages we just built (provides phpize, headers, php-config)
+          sudo dpkg -i ./debs/*.deb || sudo apt-get -f install -y
+          # PECL extension build dependencies
+          sudo apt-get install -y --no-install-recommends \
+            checkinstall php-pear \
+            libmagickwand-dev libmagickcore-dev \
+            libmemcached-dev zlib1g-dev libsasl2-dev \
+            libssl-dev libcurl4-openssl-dev
+
+      - name: Build PECL extensions
+        run: |
+          set -uo pipefail
+
+          # ------------------------------------------------------------------
+          # PECL extensions to build.
+          # All 8 are confirmed to compile against PHP 8.6 with patches.
+          # ------------------------------------------------------------------
+          EXTENSIONS="xdebug redis igbinary msgpack apcu mongodb imagick memcached"
+
+          SERIES="${{ inputs.target_series }}"
+          OUT_DIR="$PWD/pecl-builds"
+          mkdir -p "$OUT_DIR"
+
+          PASS=0
+          FAIL=0
+
+          for EXT in $EXTENSIONS; do
+            echo "::group::$EXT"
+            WORK=$(mktemp -d)
+            cd "$WORK"
+
+            # --- resolve git repo URL ---
+            REPO_URL=""
+            case "$EXT" in
+              xdebug)    REPO_URL="https://github.com/xdebug/xdebug.git" ;;
+              redis)     REPO_URL="https://github.com/phpredis/phpredis.git" ;;
+              igbinary)  REPO_URL="https://github.com/igbinary/igbinary.git" ;;
+              msgpack)   REPO_URL="https://github.com/msgpack/msgpack-php.git" ;;
+              apcu)      REPO_URL="https://github.com/krakjoe/apcu.git" ;;
+              mongodb)   REPO_URL="https://github.com/mongodb/mongo-php-driver.git" ;;
+              imagick)   REPO_URL="https://github.com/Imagick/imagick.git" ;;
+              memcached) REPO_URL="https://github.com/php-memcached-dev/php-memcached.git" ;;
+              *)
+                echo "::warning::Unknown extension: $EXT"
+                rm -rf "$WORK"; echo "::endgroup::"; continue
+                ;;
+            esac
+
+            # --- clone from official GitHub repo ---
+            echo "Cloning $REPO_URL ..."
+            CLONE_OPTS="--depth 1 --tags"
+            [ "$EXT" = "mongodb" ] && CLONE_OPTS="--depth 1 --tags --recurse-submodules --shallow-submodules"
+            CLONE_OK=false
+            for attempt in 1 2 3; do
+              if timeout 120 git clone $CLONE_OPTS "$REPO_URL" src 2>&1; then
+                CLONE_OK=true
+                break
+              fi
+              echo "  clone attempt $attempt failed, retrying in 5s..."
+              rm -rf src
+              sleep 5
+            done
+            if [ "$CLONE_OK" = false ]; then
+              echo "::warning::git clone failed for $EXT after 3 attempts"
+              FAIL=$((FAIL+1))
+              rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+            cd src
+
+            # --- version from package source (not git tags) ---
+            EXT_VER=""
+            if [ -f package.xml ]; then
+              EXT_VER=$(grep -oP '<release>\K[^<]+' package.xml | head -1) || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              HEADER=$(find . -maxdepth 2 -name 'php_*.h' | head -1)
+              [ -n "$HEADER" ] && EXT_VER=$(grep -oP 'PHP_\w+_VERSION\s+"?\K[^"]+' "$HEADER" | head -1) || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              EXT_VER=$(git describe --tags 2>/dev/null | sed 's/^v//') || true
+            fi
+            if [ -z "$EXT_VER" ]; then
+              EXT_VER="0.0.0~$(git rev-parse --short HEAD)"
+            fi
+            [[ ! "$EXT_VER" =~ ^[0-9] ]] && EXT_VER="0.0.0~${EXT_VER}"
+            echo "Version: $EXT_VER"
+
+            # --- apply PHP 8.6 compatibility patches ---
+            case "$EXT" in
+              imagick)
+                if [ -f imagick_class.c ]; then
+                  sed -i 's/zend_is_callable(user_callback, 0, NULL TSRMLS_CC)/zend_is_callable_ex(user_callback, NULL, 0, NULL, NULL, NULL)/g' imagick_class.c
+                  echo "  [PATCH] Applied zend_is_callable_ex patch"
+                fi
+                ;;
+              msgpack)
+                # PHP 8.6: PG(unserialize_callback_func) changed from char* to zend_string*
+                for SRC_FILE in msgpack_unpack.c msgpack_class.c; do
+                  if [ -f "$SRC_FILE" ]; then
+                    sed -i 's/PG(unserialize_callback_func)\[0\] == .\\0./ZSTR_LEN(PG(unserialize_callback_func)) == 0/g' "$SRC_FILE"
+                    echo "  [PATCH] Applied PG(unserialize_callback_func) patch in $SRC_FILE"
+                  fi
+                done
+                ;;
+            esac
+
+            # --- phpize ---
+            PHPIZE="phpize${SERIES}"
+            PCONF="/usr/bin/php-config${SERIES}"
+            [ ! -x "$PCONF" ] && PCONF="/usr/bin/php-config"
+
+            echo "Running phpize ..."
+            if ! "$PHPIZE" 2>&1; then
+              echo "::warning::phpize failed for $EXT"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- configure ---
+            CONF_EXTRA=""
+            case "$EXT" in
+              imagick)   CONF_EXTRA="--with-imagick" ;;
+              memcached) CONF_EXTRA="--with-libmemcached-dir=/usr --disable-memcached-sasl" ;;
+            esac
+
+            echo "Running configure --with-php-config=$PCONF $CONF_EXTRA ..."
+            if ! ./configure --with-php-config="$PCONF" $CONF_EXTRA 2>&1; then
+              echo "::warning::configure failed for $EXT"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- compile ---
+            echo "Running make -j$(nproc) ..."
+            if ! make -j"$(nproc)" 2>&1; then
+              echo "::warning::make failed for $EXT"
+              FAIL=$((FAIL+1))
+              cd /; rm -rf "$WORK"; echo "::endgroup::"; continue
+            fi
+
+            # --- package as .deb via checkinstall ---
+            echo "Running checkinstall (pwd: $(pwd)) ..."
+            if sudo checkinstall -D \
+              --pkgname="php${SERIES}-${EXT}" \
+              --pkgversion="$EXT_VER" \
+              --pkgrelease="1" \
+              --maintainer="markusfoo" \
+              --pkgsource="PECL" \
+              --pkggroup="php" \
+              --nodoc \
+              --fstrans=no \
+              --backup=no \
+              --install=no \
+              -y make install 2>&1; then
+
+              # Look for .deb in CWD first, then search broader
+              CREATED=$(ls -t *.deb 2>/dev/null | head -1 || true)
+              if [ -z "$CREATED" ]; then
+                CREATED=$(find "$WORK" -maxdepth 3 -name '*.deb' -print -quit 2>/dev/null || true)
+              fi
+              if [ -z "$CREATED" ]; then
+                CREATED=$(find /tmp -maxdepth 3 -name "php${SERIES}-${EXT}_*.deb" -print -quit 2>/dev/null || true)
+              fi
+              if [ -n "$CREATED" ] && [ -f "$CREATED" ]; then
+                mv "$CREATED" "${OUT_DIR}/"
+                PASS=$((PASS+1))
+                echo "  Built: $(basename "$CREATED")"
+              else
+                echo "::warning::checkinstall succeeded but no .deb found for $EXT"
+                echo "  pwd=$(pwd)  ls=$(ls *.deb 2>&1 || true)"
+                FAIL=$((FAIL+1))
+              fi
+            else
+              echo "::warning::checkinstall failed for $EXT"
+              FAIL=$((FAIL+1))
+            fi
+
+            cd /
+            rm -rf "$WORK"
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "=== PECL Build Summary ==="
+          echo "  Passed: $PASS  |  Failed: $FAIL"
+          if ls "$OUT_DIR"/*.deb 1>/dev/null 2>&1; then
+            echo "  Built $(ls "$OUT_DIR"/*.deb | wc -l) .deb package(s):"
+            ls -lh "$OUT_DIR"/
+          else
+            echo "  No PECL extensions were successfully built."
+          fi
+
+      - name: Upload PECL .deb artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: pecl-debs
+          path: pecl-builds/*.deb
+          if-no-files-found: warn
+          include-hidden-files: true
+
+  # ==========================================================================
+  # JOB 6.5 -- End-to-end WordPress test (e2e).
+  #
+  # Proves the built PHP packages can serve a real-world PHP application
+  # (WordPress) through PHP-FPM + Nginx on a clean Ubuntu 22.04 container.
+  # This catches issues that CLI-only smoke tests miss: FPM pool problems,
+  # shared-memory issues, opcode cache under real load, and extension
+  # crashes that only manifest in a server context.
+  #
+  # SKIP-LIST MECHANISM:
+  #   If a PECL extension causes PHP-FPM to crash, this job identifies the
+  #   culprit, removes it, re-tests, and produces a skip-list artifact so
+  #   the publish job can exclude those broken packages.  Core PHP failures
+  #   always hard-fail and block the release.
+  # ==========================================================================
+  e2e-wordpress-test:
+    name: E2E WordPress test (e2e)
+    needs: [smoke-test, build-pecl]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download PHP .deb files
+        uses: actions/download-artifact@v7
+        with:
+          name: php-debs
+          path: debs
+
+      - name: Download PECL .deb files (if any)
+        uses: actions/download-artifact@v7
+        with:
+          name: pecl-debs
+          path: pecl-debs
+        continue-on-error: true
+
+      - name: Configure apt for CI reliability
+        run: |
+          set -euxo pipefail
+          mkdir -p /etc/apt/apt.conf.d
+          tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+
+      - name: "Add packages.sury.org/php (runtime dependency: php-common)"
+        run: |
+          set -euxo pipefail
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then break; fi
+            echo "::warning::apt-get update attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+          apt-get install -y --no-install-recommends gnupg ca-certificates curl
+          curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then break; fi
+            echo "::warning::apt-get update (post-PPA) attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+
+      - name: "Add PGDG apt repository (runtime dependency: libpq5 >= 17~)"
+        run: |
+          set -euxo pipefail
+          apt-get install -y --no-install-recommends postgresql-common
+          for attempt in 1 2 3; do
+            if timeout 60 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y; then break; fi
+            echo "::warning::PGDG repo setup attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::PGDG repo failed"; exit 1; }
+          done
+          for attempt in 1 2 3; do
+            if timeout 60 apt-get update; then break; fi
+            echo "::warning::apt-get update (post-PGDG) attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+          done
+
+      - name: Install PHP packages (all)
+        run: |
+          set -euxo pipefail
+          apt-get install -y --no-install-recommends ./debs/*.deb
+          if ls pecl-debs/*.deb 1>/dev/null 2>&1; then
+            dpkg -i ./pecl-debs/*.deb || apt-get -f install -y
+          fi
+          echo "=== All packages installed ==="
+
+      - name: Install web server and download WordPress
+        run: |
+          set -euxo pipefail
+          apt-get install -y --no-install-recommends nginx
+          mkdir -p /var/www/html
+          curl -fsSL https://wordpress.org/latest.tar.gz | tar xz -C /tmp
+          cp -a /tmp/wordpress/. /var/www/html/
+          chown -R www-data:www-data /var/www/html
+          echo "WordPress extracted to /var/www/html/"
+          ls /var/www/html/wp-login.php /var/www/html/wp-admin/install.php
+
+      - name: Configure PHP-FPM pool for WordPress
+        run: |
+          set -euxo pipefail
+          SERIES="${{ inputs.target_series }}"
+          POOL_CONF="/etc/php/${SERIES}/fpm/pool.d/www.conf"
+          if [ -f "$POOL_CONF" ]; then
+            sed -i "s|^listen = .*|listen = /run/php/php${SERIES}-fpm.sock|" "$POOL_CONF"
+            sed -i 's|^;listen.mode = .*|listen.mode = 0666|' "$POOL_CONF"
+            sed -i "s|^;php_admin_value\[error_log\] = .*|php_admin_value[error_log] = /var/log/php${SERIES}-fpm-e2e.log|" "$POOL_CONF"
+            sed -i 's|^;php_admin_flag\[log_errors\] = .*|php_admin_flag[log_errors] = on|' "$POOL_CONF"
+            sed -i 's|^php_admin_value\[error_reporting\] = .*|php_admin_value[error_reporting] = E_ALL|' "$POOL_CONF"
+            echo "Pool configured: $POOL_CONF"
+          else
+            echo "::error::FPM pool config not found at $POOL_CONF"
+            exit 1
+          fi
+          mkdir -p /run/php
+
+      - name: Configure Nginx for WordPress
+        run: |
+          set -euxo pipefail
+          SERIES="${{ inputs.target_series }}"
+          cat > /etc/nginx/sites-available/wordpress <<'NGINX'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              root /var/www/html;
+              index index.php index.html;
+              server_name _;
+              client_max_body_size 64M;
+              location / {
+                  try_files $uri $uri/ /index.php?$query_string;
+              }
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php/__PHP_FPM_SOCK__;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  fastcgi_read_timeout 60;
+              }
+              location ~ /\. { deny all; }
+          }
+          NGINX
+          sed -i "s/__PHP_FPM_SOCK__/php${SERIES}-fpm.sock/g" /etc/nginx/sites-available/wordpress
+          rm -f /etc/nginx/sites-enabled/default
+          ln -sf /etc/nginx/sites-available/wordpress /etc/nginx/sites-enabled/wordpress
+          nginx -t
+          echo "Nginx configured."
+
+      - name: Start PHP-FPM and Nginx
+        id: services
+        run: |
+          set -euxo pipefail
+          SERIES="${{ inputs.target_series }}"
+          php-fpm${SERIES} --daemonize 2>/tmp/fpm-startup.log || {
+            echo "::error::PHP-FPM failed to start"
+            cat /tmp/fpm-startup.log
+            exit 1
+          }
+          echo "PHP-FPM started."
+          sleep 1
+          if [ ! -S /run/php/php${SERIES}-fpm.sock ]; then
+            echo "::error::FPM socket not created"
+            cat /tmp/fpm-startup.log 2>/dev/null || true
+            exit 1
+          fi
+          nginx 2>/tmp/nginx-startup.log || {
+            echo "::error::Nginx failed to start"
+            cat /tmp/nginx-startup.log
+            exit 1
+          }
+          echo "Nginx started."
+          sleep 1
+
+      - name: Run WordPress E2E tests
+        id: e2e
+        run: |
+          set -euxo pipefail
+          SERIES="${{ inputs.target_series }}"
+          E2E_LOG="/tmp/e2e-test-results.log"
+          FAIL=0
+          SKIP_LIST=""
+
+          echo "=== E2E WordPress Test ===" | tee "$E2E_LOG"
+
+          # Test 1: WordPress installer page loads
+          # Use -L to follow redirects (fresh WP install returns 302)
+          HTTP_CODE=$(curl -sL -o /tmp/wp-install.html -w '%{http_code}' http://localhost/wp-admin/install.php --max-time 10 || echo "000")
+          echo "Test 1 - wp-admin/install.php: HTTP $HTTP_CODE" | tee -a "$E2E_LOG"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "  PASS" | tee -a "$E2E_LOG"
+          else
+            echo "  FAIL" | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          fi
+
+          # Test 2: Response contains WordPress content
+          if [ -f /tmp/wp-install.html ] && grep -qi 'wordpress\|select language\|welcome' /tmp/wp-install.html 2>/dev/null; then
+            echo "Test 2 - WP content detected: PASS" | tee -a "$E2E_LOG"
+          else
+            echo "Test 2 - WP content detected: FAIL" | tee -a "$E2E_LOG"
+            head -20 /tmp/wp-install.html 2>/dev/null | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          fi
+
+          # Test 3: wp-login.php loads
+          HTTP_CODE=$(curl -sL -o /tmp/wp-login.html -w '%{http_code}' http://localhost/wp-login.php --max-time 10 || echo "000")
+          echo "Test 3 - wp-login.php: HTTP $HTTP_CODE" | tee -a "$E2E_LOG"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "  PASS" | tee -a "$E2E_LOG"
+          else
+            echo "  FAIL" | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          fi
+
+          # Test 4: PHP info page works
+          echo "<?php phpinfo(INFO_GENERAL); ?>" > /var/www/html/info.php
+          HTTP_CODE=$(curl -s -o /tmp/phpinfo.html -w '%{http_code}' http://localhost/info.php --max-time 10 || echo "000")
+          echo "Test 4 - phpinfo(): HTTP $HTTP_CODE" | tee -a "$E2E_LOG"
+          if [ "$HTTP_CODE" = "200" ] && grep -qi 'PHP Version' /tmp/phpinfo.html 2>/dev/null; then
+            echo "  PASS" | tee -a "$E2E_LOG"
+          else
+            echo "  FAIL" | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          fi
+          rm -f /var/www/html/info.php
+
+          # Test 5: index.php (front page) loads
+          HTTP_CODE=$(curl -sL -o /tmp/wp-index.html -w '%{http_code}' http://localhost/ --max-time 10 || echo "000")
+          echo "Test 5 - index.php: HTTP $HTTP_CODE" | tee -a "$E2E_LOG"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "  PASS" | tee -a "$E2E_LOG"
+          else
+            echo "  FAIL" | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          fi
+
+          # Test 6: No PHP fatal errors in FPM log
+          FPM_LOG="/var/log/php${SERIES}-fpm-e2e.log"
+          echo "Test 6 - FPM error log check" | tee -a "$E2E_LOG"
+          if [ -f "$FPM_LOG" ]; then
+            FATALS=$(grep -ciE '(Fatal error|segfault|SIGSEGV|core dump|panic)' "$FPM_LOG" 2>/dev/null) || FATALS=0
+            if [ "$FATALS" -gt 0 ]; then
+              echo "  FAIL: $FATALS fatal error(s) in FPM log" | tee -a "$E2E_LOG"
+              echo "  --- FPM Error Log ---" | tee -a "$E2E_LOG"
+              cat "$FPM_LOG" | tee -a "$E2E_LOG"
+              FAIL=$((FAIL + 1))
+              echo "  --- Scanning for broken PECL extensions ---" | tee -a "$E2E_LOG"
+              for ext in redis mongodb igbinary msgpack apcu imagick xdebug memcached; do
+                if grep -qi "$ext" "$FPM_LOG" 2>/dev/null; then
+                  echo "" | tee -a "$E2E_LOG"
+                  echo "  BROKEN EXTENSION DETECTED: $ext" | tee -a "$E2E_LOG"
+                  echo "  Relevant FPM log lines:" | tee -a "$E2E_LOG"
+                  grep -i "$ext" "$FPM_LOG" | sed 's/^/    /' | tee -a "$E2E_LOG"
+                  echo "  ACTION: Extension '$ext' added to skip list" | tee -a "$E2E_LOG"
+                  echo "::warning::Extension '$ext' may have caused a crash - adding to skip list. See E2E log for details."
+                  SKIP_LIST="${SKIP_LIST}${ext} "
+                fi
+              done
+            else
+              echo "  PASS: no fatal errors" | tee -a "$E2E_LOG"
+            fi
+          else
+            echo "  PASS: no FPM error log (no errors written)" | tee -a "$E2E_LOG"
+          fi
+
+          # Test 7: Check Nginx error log for upstream failures
+          echo "Test 7 - Nginx error log check" | tee -a "$E2E_LOG"
+          NGINX_ERR=$(grep -ciE '(502|503|upstream.*failed)' /var/log/nginx/error.log 2>/dev/null) || NGINX_ERR=0
+          if [ "$NGINX_ERR" -gt 0 ]; then
+            echo "  FAIL: $NGINX_ERR upstream error(s) in Nginx log" | tee -a "$E2E_LOG"
+            cat /var/log/nginx/error.log | tail -20 | tee -a "$E2E_LOG"
+            FAIL=$((FAIL + 1))
+          else
+            echo "  PASS: no upstream errors" | tee -a "$E2E_LOG"
+          fi
+
+          # Summary
+          echo "" | tee -a "$E2E_LOG"
+          echo "=== E2E Test Summary ===" | tee -a "$E2E_LOG"
+          if [ "$FAIL" -eq 0 ]; then
+            echo "ALL TESTS PASSED" | tee -a "$E2E_LOG"
+          else
+            echo "$FAIL test(s) FAILED" | tee -a "$E2E_LOG"
+          fi
+
+          echo "fail=$FAIL" >> "$GITHUB_OUTPUT"
+          echo "skip_list=$SKIP_LIST" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt auto-fix by removing broken PECL extensions
+        id: autofix
+        if: steps.e2e.outputs.fail != '0' && steps.e2e.outputs.skip_list != ''
+        run: |
+          set -euxo pipefail
+          SERIES="${{ inputs.target_series }}"
+          SKIP="${{ steps.e2e.outputs.skip_list }}"
+          echo "::warning::E2E tests failed. Attempting auto-fix by removing broken extensions: $SKIP"
+
+          nginx -s stop 2>/dev/null || true
+          php${SERIES}-fpm -s stop 2>/dev/null || true
+          sleep 1
+
+          for ext in $SKIP; do
+            PKG="php${SERIES}-${ext}"
+            if dpkg -l "$PKG" >/dev/null 2>&1; then
+              echo "Removing broken extension: $PKG"
+              dpkg --purge "$PKG" || apt-get remove -y "$PKG" || true
+            fi
+          done
+
+          rm -f "/var/log/php${SERIES}-fpm-e2e.log"
+
+          php-fpm${SERIES} --daemonize 2>/dev/null || {
+            echo "::error::PHP-FPM failed to restart after removing broken extensions"
+            exit 1
+          }
+          sleep 1
+          nginx 2>/dev/null || {
+            echo "::error::Nginx failed to restart"
+            exit 1
+          }
+          sleep 1
+
+          RETRY_FAIL=0
+          HTTP_CODE=$(curl -sL -o /dev/null -w '%{http_code}' http://localhost/wp-admin/install.php --max-time 10 || echo "000")
+          echo "Retry - wp-admin/install.php: HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ] || RETRY_FAIL=$((RETRY_FAIL + 1))
+
+          HTTP_CODE=$(curl -sL -o /dev/null -w '%{http_code}' http://localhost/wp-login.php --max-time 10 || echo "000")
+          echo "Retry - wp-login.php: HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ] || RETRY_FAIL=$((RETRY_FAIL + 1))
+
+          FPM_LOG="/var/log/php${SERIES}-fpm-e2e.log"
+          if [ -f "$FPM_LOG" ]; then
+            FATALS=$(grep -ciE '(Fatal error|segfault|SIGSEGV)' "$FPM_LOG" 2>/dev/null) || FATALS=0
+            if [ "$FATALS" -gt 0 ]; then
+              echo "Retry FAIL: still $FATALS fatal error(s) after removing broken extensions"
+              RETRY_FAIL=$((RETRY_FAIL + 1))
+            fi
+          fi
+
+          if [ "$RETRY_FAIL" -eq 0 ]; then
+            echo "auto_fixed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Auto-fix succeeded. Skip list: $SKIP"
+          else
+            echo "::error::Auto-fix failed -- core PHP may be broken"
+            exit 1
+          fi
+
+      - name: Generate skip-list for publish job
+        id: skip-info
+        if: always()
+        run: |
+          SERIES="${{ inputs.target_series }}"
+          SKIP_FILE="/tmp/skip-list.txt"
+          FPM_LOG="/var/log/php${SERIES}-fpm-e2e.log"
+          touch "$SKIP_FILE"
+          HAS_SKIPS="false"
+
+          echo "=== Skip-List Generation ==="
+          echo "E2E test fail count: ${{ steps.e2e.outputs.fail }}"
+          echo "Extensions flagged: ${{ steps.e2e.outputs.skip_list }}"
+
+          if [ "${{ steps.e2e.outputs.fail }}" != "0" ]; then
+            if [ "${{ steps.e2e.outputs.skip_list }}" != "" ]; then
+              echo ""
+              echo "--- Detailed breakdown of broken extensions ---"
+              for ext in ${{ steps.e2e.outputs.skip_list }}; do
+                echo ""
+                echo "[EXTENSION] $ext"
+                # Show the actual FPM error lines that caused this extension to be flagged
+                if [ -f "$FPM_LOG" ] && grep -qi "$ext" "$FPM_LOG" 2>/dev/null; then
+                  echo "  FPM log errors involving '$ext':"
+                  grep -i "$ext" "$FPM_LOG" | sed 's/^/    /'
+                else
+                  echo "  (No matching lines found in FPM log at this stage)"
+                fi
+                DEB=$(ls pecl-debs/php${SERIES}-${ext}_*.deb 2>/dev/null | head -1)
+                if [ -n "$DEB" ]; then
+                  basename "$DEB" >> "$SKIP_FILE"
+                  echo "  Package to skip: $(basename "$DEB")"
+                  HAS_SKIPS="true"
+                else
+                  echo "  (No matching .deb found in pecl-debs/)"
+                fi
+              done
+            else
+              echo ""
+              echo "E2E failed but no PECL extensions were flagged in the FPM error log."
+              echo "The failure is likely caused by core PHP, not a PECL extension."
+              if [ -f "$FPM_LOG" ]; then
+                echo ""
+                echo "--- Full FPM error log for diagnosis ---"
+                head -50 "$FPM_LOG"
+              fi
+            fi
+          else
+            echo "No packages to skip -- all E2E tests passed."
+          fi
+
+          if [ -s "$SKIP_FILE" ]; then
+            echo ""
+            echo "::warning::Skip-list generated with $(wc -l < "$SKIP_FILE") package(s)"
+          fi
+          echo "has_skips=$HAS_SKIPS" >> "$GITHUB_OUTPUT"
+
+      - name: Upload E2E test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-results
+          path: /tmp/e2e-test-results.log
+          retention-days: 7
+
+      - name: Upload skip-list for publish job
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: skip-list
+          path: /tmp/skip-list.txt
+          retention-days: 1
+
+      - name: Final gate
+        if: steps.e2e.outputs.fail != '0'
+        run: |
+          echo "::error::E2E WordPress test failed. See e2e-test-results artifact for details."
+          exit 1
+  # ==========================================================================
+  # JOB 7 -- publishes .deb packages to a GitHub Release.
+  #
+  # Only runs after the E2E WordPress test (e2e) passes. If the e2e test
+  # produced a skip-list (broken PECL extensions auto-detected), those
+  # packages are excluded from the release.
+  #
+  # SMART RELEASE MANAGEMENT:
+  #   - If a release for this VERSION_TAG already exists, new .deb files
+  #     are UPLOADED to it (existing assets are kept). The release body
+  #     is updated with a dated entry listing any newly added PECL
+  #     extensions.
+  #   - If no release exists yet, a new one is created with full metadata
+  #     and a PECL extensions table.
+  #   - Beta/RC/alpha versions are automatically marked as pre-release.
+  # ==========================================================================
+  publish:
+    name: Publish to GitHub Release
+    needs: [smoke-test, build-pecl, e2e-wordpress-test]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download PHP .deb files
+        uses: actions/download-artifact@v7
+        with:
+          name: php-debs
+          path: php-debs
+
+      - name: Download PECL .deb files (if any)
+        uses: actions/download-artifact@v7
+        with:
+          name: pecl-debs
+          path: pecl-debs
+        continue-on-error: true
+
+      - name: Download E2E skip-list (if any packages were skipped)
+        uses: actions/download-artifact@v7
+        with:
+          name: skip-list
+          path: skip-list
+        continue-on-error: true
+
+      - name: Upsert GitHub Release with .deb packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+
+          SAFE_VERSION=$(echo "${{ inputs.pkg_upstream_version }}" | tr '~' '-')
+          VERSION_TAG="php${SAFE_VERSION}-${{ inputs.pkg_revision }}"
+          RELEASE_NAME="PHP ${SAFE_VERSION}-${{ inputs.pkg_revision }}"
+          SERIES="${{ inputs.target_series }}"
+
+          # -----------------------------------------------------------------
+          # Pre-release flag
+          # -----------------------------------------------------------------
+          if echo "${{ inputs.pkg_upstream_version }}" | grep -qE '(alpha|beta|rc|~)'; then
+            PRERELEASE_FLAG="--prerelease"
+          else
+            PRERELEASE_FLAG=""
+          fi
+
+          # -----------------------------------------------------------------
+          # Build PECL extensions table (for new-release body)
+          # -----------------------------------------------------------------
+          PECL_TABLE=""
+          if [ -d "pecl-debs" ] && ls pecl-debs/*.deb 1>/dev/null 2>&1; then
+            PECL_TABLE=$(printf '| Extension | Version |\n|---|---|\n')
+            for deb in pecl-debs/*.deb; do
+              BN=$(basename "$deb" .deb)
+              EN=$(echo "$BN" | sed "s/^php${SERIES}-//;s/_.*//")
+              EV=$(echo "$BN" | sed "s/^php${SERIES}-[^_]*_//;s/_amd64//")
+              PECL_TABLE="${PECL_TABLE}| ${EN} | \`${EV}\` |\n"
+            done
+          fi
+
+          # -----------------------------------------------------------------
+          # Check if a release for this tag already exists
+          # -----------------------------------------------------------------
+          RELEASE_EXISTS=false
+          EXISTING_ASSETS=""
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+            EXISTING_ASSETS=$(gh release view "$VERSION_TAG" --json assets -q '.assets[].name' 2>/dev/null | sort)
+          fi
+
+          # -----------------------------------------------------------------
+          # Collect only the NEW .deb files (not yet in the release)
+          # -----------------------------------------------------------------
+          NEW_DEBS=()
+          NEW_PECL=""
+
+          # Build skip-set from e2e test (empty if all packages are good)
+          SKIP_SET=""
+          if [ -f skip-list/skip-list.txt ] && [ -s skip-list/skip-list.txt ]; then
+            SKIP_SET=$(sort skip-list/skip-list.txt | tr $'\n' '|' | sed 's/|$//;s/|/\\|/g')
+            echo "::warning::E2E skip-list active -- excluding packages matching: $SKIP_SET"
+          fi
+
+          # PECL extensions first
+          for deb in pecl-debs/*.deb; do
+            [ -f "$deb" ] || continue
+            DN=$(basename "$deb")
+            if echo "$EXISTING_ASSETS" | grep -qF "$DN"; then
+              echo "  skip (already uploaded): $DN"
+            elif [ -n "$SKIP_SET" ] && echo "$DN" | grep -qE "$SKIP_SET"; then
+              echo "  skip (e2e-test excluded): $DN"
+            else
+              NEW_DEBS+=("$deb")
+              BN=$(basename "$DN" .deb)
+              EN=$(echo "$BN" | sed "s/^php${SERIES}-//;s/_.*//")
+              EV=$(echo "$BN" | sed "s/^php${SERIES}-[^_]*_//;s/_amd64//")
+              NEW_PECL="${NEW_PECL}| ${EN} | \`${EV}\` |\n"
+              echo "  new PECL: $DN"
+            fi
+          done
+
+          # PHP core packages (never skipped -- e2e hard-fails on core issues)
+          for deb in php-debs/*.deb; do
+            [ -f "$deb" ] || continue
+            DN=$(basename "$deb")
+            if echo "$EXISTING_ASSETS" | grep -qF "$DN"; then
+              echo "  skip (already uploaded): $DN"
+            else
+              NEW_DEBS+=("$deb")
+              echo "  new PHP: $DN"
+            fi
+          done
+
+          if [ "${#NEW_DEBS[@]}" -eq 0 ]; then
+            echo "::notice::All packages already present in release $VERSION_TAG -- nothing to upload."
+            exit 0
+          fi
+
+          echo "Uploading ${#NEW_DEBS[@]} new package(s) to release $VERSION_TAG"
+
+          # -----------------------------------------------------------------
+          # Create or update the release
+          # -----------------------------------------------------------------
+          TODAY=$(date -u +%Y-%m-%d)
+
+          if [ "$RELEASE_EXISTS" = true ]; then
+            # --- UPDATE existing release ---
+            gh release upload "$VERSION_TAG" "${NEW_DEBS[@]}"
+
+            if [ -n "$NEW_PECL" ]; then
+              gh release view "$VERSION_TAG" --json body -q '.body' > /tmp/current-body.md
+              printf -- '\n---\n\n### Added %s (run #%s)\n\n| Extension | Version |\n|---|---|\n%s' \
+                "$TODAY" "$GITHUB_RUN_NUMBER" "$NEW_PECL" >> /tmp/current-body.md
+              gh release edit "$VERSION_TAG" --notes-file /tmp/current-body.md
+              echo "::notice::Updated release $VERSION_TAG with new PECL extensions"
+            else
+              echo "::notice::Uploaded packages to existing release $VERSION_TAG"
+            fi
+          else
+            # --- CREATE new release ---
+            cat > /tmp/release-notes.md <<NOTES_EOF
+          ## PHP ${{ inputs.target_series }} Build
+
+          | | |
+          |---|---|
+          | **Source tag** | \`${{ inputs.php_tag }}\` |
+          | **Version** | \`${{ inputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}\` |
+          | **Distro** | Ubuntu 22.04 (jammy) / amd64 |
+          | **Workflow run** | [#$GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |
+          NOTES_EOF
+
+            if [ -n "$PECL_TABLE" ]; then
+              printf -- '\n### PECL Extensions\n\n%s' "$PECL_TABLE" >> /tmp/release-notes.md
+            fi
+
+            cat >> /tmp/release-notes.md <<'INSTALL_EOF'
+
+          ### Installation
+
+          Download all .\*.deb files from the Assets below, then:
+
+          \`\`\`bash
+          sudo dpkg -i php*.deb
+          sudo apt-get -f install
+          \`\`\`
+
+          Or download individually and install the packages you need.
+          INSTALL_EOF
+
+            gh release create "$VERSION_TAG" \
+              --title "$RELEASE_NAME" \
+              --notes-file /tmp/release-notes.md \
+              ${PRERELEASE_FLAG} \
+              "${NEW_DEBS[@]}"
+          fi
+
+          echo "::notice::Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION_TAG"
