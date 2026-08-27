@@ -70,7 +70,7 @@ on:
       php_tag:
         description: "Git tag in php/php-src to build"
         type: string
-        default: "php-8.6.0beta1"
+        default: "php-8.6.0beta2"
       target_series:
         description: "PHP series -- must match packaging/debian/ (phpX.Y-*)"
         type: string
@@ -78,11 +78,11 @@ on:
       pkg_upstream_version:
         description: "Debian-ordered upstream version string (~ sorts before nothing, so ~beta1 < final)"
         type: string
-        default: "8.6.0~beta1"
+        default: "8.6.0~beta2"
       pkg_revision:
         description: "Debian package revision suffix"
         type: string
-        default: "1"
+        default: "2"
       publish:
         description: "Create a GitHub Release with .deb packages if build + smoke-test pass"
         type: boolean
