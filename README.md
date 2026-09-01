@@ -51,6 +51,7 @@ Built automatically in the `build-pecl` job. To add or remove extensions,
 edit the `EXTENSIONS` variable in `build-php.yml`.
 
 Imagick and msgpack include build-time patches for PHP 8.6 API compatibility.
+Redis is built with compression support (lzf, zstd, lz4).
 
 ### Smart release management
 
@@ -163,6 +164,32 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 ---
 
 ## Changelog
+
+### 2026-09-01 — Redis compression support (lzf / zstd / lz4)
+
+- The `php8.6-redis` package is now compiled with compression support:
+  `--enable-redis-lzf`, `--enable-redis-zstd --with-libzstd`,
+  `--enable-redis-lz4 --with-liblz4`. Serializers stay `php, json`,
+  package version unchanged (6.3.0RC1-1)
+- Added `build-redis.yml`: dedicated workflow that rebuilds the redis .deb
+  with compression and updates the release asset in place. Pipeline mirrors
+  the PECL job in `build-php.yml` (phpredis default branch, version from
+  `package.xml`, checkinstall packaging) — the only change is the
+  compression flags
+- liblzf 3.6 sources are bundled and linked statically, so `redis.so` has
+  no runtime dependency on `liblzf.so.1`; zstd/lz4 come from the system dev
+  libraries (`libzstd-dev`, `liblz4-dev`)
+- Hard verification gates in CI: phpinfo must report
+  `Available compression => lzf, zstd, lz4`, the `Redis::COMPRESSION_LZF`,
+  `Redis::COMPRESSION_ZSTD` and `Redis::COMPRESSION_LZ4` constants must
+  exist, and round-trip compression tests must pass against a live
+  redis-server (php+lzf, php+zstd, php+lz4, json+zstd)
+- `build-php.yml` got the matching minimal patch: redis `CONF_EXTRA`
+  compression flags + `libzstd-dev`/`liblz4-dev` build dependencies, so
+  future full builds keep compression support
+- Release `php8.6.0-beta2-3` updated in place:
+  `php8.6-redis_6.3.0RC1-1_amd64.deb` replaced with the compression-enabled
+  build (same file name, same package version)
 
 ### 2026-08-24 — E2E WordPress Compatibility Audit System
 
