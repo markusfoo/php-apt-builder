@@ -722,6 +722,12 @@ jobs:
                 sudo make install >/dev/null
               )
               echo "  [PREBUILD] igbinary 3.2.17RC1 installed (headers for redis igbinary serializer)"
+
+              # NUL-terminate decompressed buffers: PHP >= 8.6's json scanner
+              # detects EOI via a NUL byte and reads past val_len, so SERIALIZER_JSON
+              # + compression depends on heap contents without this fix
+              python3 "$GITHUB_WORKSPACE/.github/patches/fix_redis_library_nul.py" || exit 1
+              echo "  [PATCH] library.c: decompress buffers NUL-terminated (PHP 8.6 json EOI)"
             fi
 
             # --- phpize ---

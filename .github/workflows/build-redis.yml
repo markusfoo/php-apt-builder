@@ -19,7 +19,9 @@ name: Repackage phpredis (igbinary + compression support)
 # Pipeline (fast, ~4 min, does NOT rebuild PHP from source):
 #   1. Downloads existing .deb packages from a GitHub Release
 #   2. Installs PHP 8.6 (cli/dev/common) from those .debs
-#   3. Clones phpredis (default branch, same as build-php.yml)
+#   3. Clones phpredis (default branch, same as build-php.yml) and
+#      NUL-terminates decompressed buffers in library.c (PHP 8.6 json
+#      scanner EOI bug — see .github/patches/fix_redis_library_nul.py)
 #   4. Configures with igbinary + compression flags, builds, packages via checkinstall
 #   5. Verifies compiled-in igbinary + compression (phpinfo + constants, hard gate)
 #   6. Functional round-trip test against a local redis-server (hard gate)
@@ -188,6 +190,19 @@ jobs:
           echo "::endgroup::"
 
           # ------------------------------------------------------------
+          # 2a. PATCH library.c — NUL-terminate decompressed buffers.
+          #     PHP >= 8.6's json scanner detects end-of-input via a NUL byte
+          #     (EOI = "\000" in ext/json/json_scanner.re; YYFILL is a no-op),
+          #     so php_json_decode reads past val_len. redis_uncompress returns
+          #     raw emalloc'd buffers without a sentinel, which makes
+          #     SERIALIZER_JSON + compression fail or pass depending on heap
+          #     contents. Terminating the buffer makes it deterministic.
+          # ------------------------------------------------------------
+          echo "::group::patch library.c (NUL-terminate decompressed buffers)"
+          python3 "$GITHUB_WORKSPACE/.github/patches/fix_redis_library_nul.py"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
           # 3. configure — defaults identical to build-php.yml, with
           #    igbinary serializer + compression flags added on top
           #    (lzf uses bundled sources)
@@ -353,7 +368,9 @@ jobs:
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_LZF,  'php  + lzf '],
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_ZSTD, 'php  + zstd'],
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_LZ4,  'php  + lz4 '],
+            [Redis::SERIALIZER_JSON, Redis::COMPRESSION_LZF,  'json + lzf '],
             [Redis::SERIALIZER_JSON, Redis::COMPRESSION_ZSTD, 'json + zstd'],
+            [Redis::SERIALIZER_JSON, Redis::COMPRESSION_LZ4,  'json + lz4 '],
           ];
           $failed = 0;
           foreach ($tests as [$ser, $comp, $label]) {
