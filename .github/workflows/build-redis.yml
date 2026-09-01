@@ -206,6 +206,16 @@ jobs:
           git clone --depth 1 --branch '${{ inputs.msgpack_ref }}' \
             https://github.com/msgpack/msgpack-php.git "$WORK/msgpack"
           cd "$WORK/msgpack"
+
+          # PHP 8.6 compatibility patch (same as build-php.yml PECL loop):
+          # PG(unserialize_callback_func) changed from char* to zend_string*
+          for SRC_FILE in msgpack_unpack.c msgpack_class.c; do
+            if [ -f "$SRC_FILE" ]; then
+              sed -i 's/PG(unserialize_callback_func)\[0\] == .\\0./ZSTR_LEN(PG(unserialize_callback_func)) == 0/g' "$SRC_FILE"
+              echo "  [PATCH] Applied PG(unserialize_callback_func) patch in $SRC_FILE"
+            fi
+          done
+
           "$PHPIZE"
           ./configure --with-php-config="$PCONF"
           make -j"$(nproc)"
