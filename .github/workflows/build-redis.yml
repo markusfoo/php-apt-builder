@@ -241,8 +241,10 @@ jobs:
           REDIS_SO="$WORK/redis/modules/redis.so"
           INFO=$("$PHP_BIN" -d extension="$REDIS_SO" -i)
           echo "$INFO" | grep -A8 "^redis$" || true
-          SER_LINE=$(echo "$INFO" | grep -i "serializer" | head -1 || true)
-          COM_LINE=$(echo "$INFO" | grep -i "compression" | head -1 || true)
+          SER_LINE=$(echo "$INFO" | grep -i "^Available serializers" | head -1 || true)
+          COM_LINE=$(echo "$INFO" | grep -i "^Available compression" | head -1 || true)
+          [ -n "$SER_LINE" ] || { echo "::error::'Available serializers' row not found in phpinfo"; exit 1; }
+          [ -n "$COM_LINE" ] || { echo "::error::'Available compression' row not found in phpinfo"; exit 1; }
           echo "Serializers line : $SER_LINE"
           echo "Compression line : $COM_LINE"
 
