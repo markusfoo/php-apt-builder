@@ -127,11 +127,11 @@ jobs:
             sleep 5
           done
 
-          # libzstd-dev / liblz4-dev: zstd + lz4 compression support
+          # liblzf-dev / libzstd-dev / liblz4-dev: compression deps for redis
           # redis-server: local instance for the functional round-trip test
           sudo apt-get install -y --no-install-recommends \
             build-essential checkinstall pkg-config git \
-            libzstd-dev liblz4-dev \
+            liblzf-dev libzstd-dev liblz4-dev \
             redis-server redis-tools
 
           # Install our PHP 8.6 debs (provides php, phpize8.6, php-config8.6)
@@ -175,7 +175,7 @@ jobs:
           echo "::group::configure (compression enabled)"
           ./configure \
             --with-php-config="$PCONF" \
-            --enable-redis-lzf \
+            --enable-redis-lzf --with-liblzf \
             --enable-redis-zstd \
             --with-libzstd \
             --enable-redis-lz4 \
