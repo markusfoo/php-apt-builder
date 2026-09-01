@@ -1,22 +1,27 @@
-name: Repackage phpredis (add compression support)
+name: Repackage phpredis (igbinary + compression support)
 
 # ==========================================================================
 # Repackages php8.6-redis EXACTLY like build-php.yml does (same source:
 # phpredis default branch, same version detection from package.xml,
-# same checkinstall packaging) — the ONLY difference is that compression
-# support is enabled at configure time:
+# same checkinstall packaging) — the ONLY differences are that igbinary
+# serializer and compression support are enabled at configure time:
 #
+#   Serializers:  php, json, igbinary  (igbinary.h comes from the
+#                                      php8.6-igbinary deb of the same
+#                                      release; igbinary.so is required at
+#                                      runtime — ZEND_MOD_REQUIRED)
 #   Compression:  lzf, zstd, lz4
 #
-# Everything else is untouched: serializers stay php/json, session+json
-# enabled by default, same version 6.3.0RC1, same package layout.
+# Everything else is untouched: same version 6.3.0RC1, same package layout.
+# The .deb declares Depends: php8.6-igbinary (same as the sury.org
+# php8.5-redis package).
 #
 # Pipeline (fast, ~4 min, does NOT rebuild PHP from source):
 #   1. Downloads existing .deb packages from a GitHub Release
 #   2. Installs PHP 8.6 (cli/dev/common) from those .debs
 #   3. Clones phpredis (default branch, same as build-php.yml)
-#   4. Configures with compression flags, builds, packages via checkinstall
-#   5. Verifies compiled-in compression (phpinfo + constants, hard gate)
+#   4. Configures with igbinary + compression flags, builds, packages via checkinstall
+#   5. Verifies compiled-in igbinary + compression (phpinfo + constants, hard gate)
 #   6. Functional round-trip test against a local redis-server (hard gate)
 #   7. Publishes: replaces php8.6-redis_*.deb on the release
 # ==========================================================================
@@ -46,7 +51,7 @@ permissions:
 
 jobs:
   build-redis:
-    name: Repackage phpredis with compression
+    name: Repackage phpredis with igbinary + compression
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -143,7 +148,7 @@ jobs:
       # Build phpredis (same as build-php.yml) + compression flags,
       # package via checkinstall, verify, test
       # ----------------------------------------------------------------
-      - name: Build and package phpredis with compression
+      - name: Build and package phpredis with igbinary + compression
         id: build
         run: |
           set -euo pipefail
@@ -183,12 +188,30 @@ jobs:
           echo "::endgroup::"
 
           # ------------------------------------------------------------
-          # 3. configure — defaults identical to build-php.yml, ONLY
-          #    compression flags added on top (lzf uses bundled sources)
+          # 3. configure — defaults identical to build-php.yml, with
+          #    igbinary serializer + compression flags added on top
+          #    (lzf uses bundled sources)
           # ------------------------------------------------------------
-          echo "::group::configure (compression enabled)"
+          echo "::group::configure (igbinary + compression enabled)"
+          # ------------------------------------------------------------
+          # 2b. igbinary (serializer dependency): the php8.6-igbinary deb
+          #     (installed together with the PHP debs) supplies igbinary.h at
+          #     compile time; igbinary.so must be loaded BEFORE redis at runtime
+          #     (zend_module_dep: ZEND_MOD_REQUIRED("igbinary"))
+          # ------------------------------------------------------------
+          echo "::group::igbinary serializer dependency"
+          IGB_INC=$(ls /usr/include/php/*/ext/igbinary/igbinary.h 2>/dev/null | head -1 || true)
+          [ -z "$IGB_INC" ] && { echo "::error::igbinary.h missing — php8.6-igbinary deb not present"; exit 1; }
+          echo "igbinary headers: $IGB_INC"
+          IGB_SO=$(find /usr/lib/php -name 'igbinary.so' -print -quit 2>/dev/null || true)
+          [ -z "$IGB_SO" ] && { echo "::error::igbinary.so not found under /usr/lib/php"; exit 1; }
+          echo "igbinary.so   : $IGB_SO"
+          "$PHP_BIN" -d extension="$IGB_SO" -m | grep -qi igbinary || { echo "::error::igbinary.so did not load"; exit 1; }
+          echo "::endgroup::"
+
           ./configure \
             --with-php-config="$PCONF" \
+            --enable-redis-igbinary \
             --enable-redis-lzf \
             --enable-redis-zstd \
             --with-libzstd \
@@ -196,7 +219,7 @@ jobs:
             --with-liblz4 2>&1 | tee configure.log
 
           # Hard gate: configure must have resolved every compression dep
-          for feat in liblzf libzstd liblz4; do
+          for feat in igbinary liblzf libzstd liblz4; do
             if grep -qiE "(Cannot find|not found|Please reinstall).*$feat|only system $feat is supported" configure.log; then
               echo "::error::phpredis configure could not resolve '$feat' support"
               exit 1
@@ -235,6 +258,7 @@ jobs:
             --fstrans=no \
             --backup=no \
             --install=no \
+            --requires="php${SERIES}-igbinary" \
             -y make install 2>&1 | tee checkinstall.log
 
           DEB=$(ls -t *.deb 2>/dev/null | head -1 || true)
@@ -261,7 +285,7 @@ jobs:
           fi
           echo "ldd: no liblzf dependency (statically bundled) OK"
 
-          INFO=$("$PHP_BIN" -d extension="$REDIS_SO" -i)
+          INFO=$("$PHP_BIN" -d extension="$IGB_SO" -d extension="$REDIS_SO" -i)
           echo "$INFO" | grep -A8 "^redis$" || true
           SER_LINE=$(echo "$INFO" | grep -i "^Available serializers" | head -1 || true)
           COM_LINE=$(echo "$INFO" | grep -i "^Available compression" | head -1 || true)
@@ -271,8 +295,8 @@ jobs:
           echo "Compression line : $COM_LINE"
 
           VERIFY_FAIL=0
-          # serializers must stay default (php/json) — nothing added, nothing removed
-          for tok in php json; do
+          # serializers: php/json stay, igbinary must be compiled in
+          for tok in php json igbinary; do
             if ! echo "$SER_LINE" | grep -qi "$tok"; then
               echo "::error::Serializer '$tok' missing (unexpected default change)"
               VERIFY_FAIL=1
@@ -287,8 +311,9 @@ jobs:
           done
           [ "$VERIFY_FAIL" -eq 0 ] || exit 1
 
-          "$PHP_BIN" -d extension="$REDIS_SO" -r '
+          "$PHP_BIN" -d extension="$IGB_SO" -d extension="$REDIS_SO" -r '
             $need = [
+              "Redis::SERIALIZER_IGBINARY" => Redis::SERIALIZER_IGBINARY,
               "Redis::COMPRESSION_LZF"  => Redis::COMPRESSION_LZF,
               "Redis::COMPRESSION_ZSTD" => Redis::COMPRESSION_ZSTD,
               "Redis::COMPRESSION_LZ4"  => Redis::COMPRESSION_LZ4,
@@ -321,6 +346,10 @@ jobs:
             'blob'    => str_repeat('x', 2048),
           ];
           $tests = [
+            [Redis::SERIALIZER_IGBINARY, Redis::COMPRESSION_NONE, 'igb  + none'],
+            [Redis::SERIALIZER_IGBINARY, Redis::COMPRESSION_LZF,  'igb  + lzf '],
+            [Redis::SERIALIZER_IGBINARY, Redis::COMPRESSION_ZSTD, 'igb  + zstd'],
+            [Redis::SERIALIZER_IGBINARY, Redis::COMPRESSION_LZ4,  'igb  + lz4 '],
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_LZF,  'php  + lzf '],
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_ZSTD, 'php  + zstd'],
             [Redis::SERIALIZER_PHP,  Redis::COMPRESSION_LZ4,  'php  + lz4 '],
@@ -340,7 +369,7 @@ jobs:
           exit($failed ? 1 : 0);
           PHP
 
-          "$PHP_BIN" -d extension="$REDIS_SO" "$WORK/test_redis.php" || {
+          "$PHP_BIN" -d extension="$IGB_SO" -d extension="$REDIS_SO" "$WORK/test_redis.php" || {
             echo "::error::functional round-trip test FAILED"
             exit 1
           }
@@ -376,9 +405,10 @@ jobs:
           # Prepend a note to the release body (keep original notes)
           gh release view "$TAG" --repo "$REPO" --json body --jq .body > /tmp/old_body.md || echo "" > /tmp/old_body.md
           {
-            echo "### $(date -u +%Y-%m-%d) — php${SERIES}-redis repackaged with compression support (lzf + zstd + lz4)"
+            echo "### $(date -u +%Y-%m-%d) — php${SERIES}-redis repackaged with igbinary serializer + compression support (lzf + zstd + lz4)"
             echo
-            echo "- Same phpredis version, compression now enabled at compile time"
+            echo "- Same phpredis version; igbinary serializer and compression now enabled at compile time"
+            echo "- Requires php${SERIES}-igbinary (declared in Depends, same as the sury php8.5-redis package)"
             echo "- New asset: \`${DEB}\` (replaces previous php${SERIES}-redis_*.deb)"
             echo
             echo "<details><summary>Original release notes</summary>"
@@ -404,8 +434,8 @@ jobs:
               echo "|---|---|"
               echo "| Release | \`${{ steps.tag.outputs.tag }}\` |"
               echo "| Package | \`${{ steps.build.outputs.deb }}\` |"
-              echo "| Compression | **lzf**, **zstd**, **lz4** (new) |"
-              echo "| Serializers | php, json (unchanged, as before) |"
+              echo "| Compression | **lzf**, **zstd**, **lz4** |"
+              echo "| Serializers | php, json, **igbinary** (new) |"
               echo "| Gates passed | configure flags, phpinfo, constants, functional round-trip |"
             else
               echo "Build FAILED — see the failed step logs above."

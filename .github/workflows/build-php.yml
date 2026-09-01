@@ -696,15 +696,32 @@ jobs:
                 ;;
             esac
 
-            # Bundle liblzf sources for redis compression (develop branch
-            # no longer ships liblzf/ dir). Static build => redis.so gets NO
-            # runtime dependency on liblzf.so.1
+            # Redis: bundle liblzf sources (develop branch no longer ships liblzf/
+            # dir; static build => no liblzf.so.1 runtime dep) and pre-build the
+            # igbinary extension so --enable-redis-igbinary finds igbinary.h
+            # (redis builds BEFORE igbinary in the loop and checkinstall uses
+            # --install=no, so headers are not installed yet at that point)
             if [ "$EXT" = "redis" ]; then
               curl -fsSL https://deb.debian.org/debian/pool/main/libl/liblzf/liblzf_3.6.orig.tar.gz -o liblzf.tgz
               mkdir -p liblzf
               tar xzf liblzf.tgz -C liblzf --strip-components=1
               rm -f liblzf.tgz
               echo "  [BUNDLE] liblzf-3.6 sources -> liblzf/ (static, no runtime dep)"
+
+              IGB_PCONF="/usr/bin/php-config${SERIES}"
+              [ ! -x "$IGB_PCONF" ] && IGB_PCONF="/usr/bin/php-config"
+              curl -fsSL https://pecl.php.net/get/igbinary-3.2.17RC1.tgz -o igbinary-prebuild.tgz
+              mkdir -p igbinary-prebuild
+              tar xzf igbinary-prebuild.tgz -C igbinary-prebuild --strip-components=1
+              rm -f igbinary-prebuild.tgz
+              (
+                cd igbinary-prebuild
+                phpize${SERIES} >/dev/null
+                ./configure --with-php-config="$IGB_PCONF" >/dev/null
+                make -j"$(nproc)" >/dev/null
+                sudo make install >/dev/null
+              )
+              echo "  [PREBUILD] igbinary 3.2.17RC1 installed (headers for redis igbinary serializer)"
             fi
 
             # --- phpize ---
@@ -724,7 +741,7 @@ jobs:
             case "$EXT" in
               imagick)   CONF_EXTRA="--with-imagick" ;;
               memcached) CONF_EXTRA="--with-libmemcached-dir=/usr --disable-memcached-sasl" ;;
-              redis)     CONF_EXTRA="--enable-redis-lzf --enable-redis-zstd --with-libzstd --enable-redis-lz4 --with-liblz4" ;;
+              redis)     CONF_EXTRA="--enable-redis-igbinary --enable-redis-lzf --enable-redis-zstd --with-libzstd --enable-redis-lz4 --with-liblz4" ;;
             esac
 
             echo "Running configure --with-php-config=$PCONF $CONF_EXTRA ..."
@@ -744,6 +761,10 @@ jobs:
 
             # --- package as .deb via checkinstall ---
             echo "Running checkinstall (pwd: $(pwd)) ..."
+            # redis depends on the igbinary extension (serializer) — same as the
+            # sury.org php8.5-redis package
+            REQ_ARGS=""
+            [ "$EXT" = "redis" ] && REQ_ARGS="--requires=php${SERIES}-igbinary"
             if sudo checkinstall -D \
               --pkgname="php${SERIES}-${EXT}" \
               --pkgversion="$EXT_VER" \
@@ -755,6 +776,7 @@ jobs:
               --fstrans=no \
               --backup=no \
               --install=no \
+              $REQ_ARGS \
               -y make install 2>&1; then
 
               # Look for .deb in CWD first, then search broader
