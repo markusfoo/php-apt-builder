@@ -597,7 +597,7 @@ jobs:
             libmagickwand-dev libmagickcore-dev \
             libmemcached-dev zlib1g-dev libsasl2-dev \
             libssl-dev libcurl4-openssl-dev \
-            liblzf-dev libzstd-dev liblz4-dev
+            libzstd-dev liblz4-dev
 
       - name: Build PECL extensions
         run: |
@@ -695,6 +695,17 @@ jobs:
                 done
                 ;;
             esac
+
+            # Bundle liblzf sources for redis compression (develop branch
+            # no longer ships liblzf/ dir). Static build => redis.so gets NO
+            # runtime dependency on liblzf.so.1
+            if [ "$EXT" = "redis" ]; then
+              curl -fsSL https://deb.debian.org/debian/pool/main/libl/liblzf/liblzf_3.6.orig.tar.gz -o liblzf.tgz
+              mkdir -p liblzf
+              tar xzf liblzf.tgz -C liblzf --strip-components=1
+              rm -f liblzf.tgz
+              echo "  [BUNDLE] liblzf-3.6 sources -> liblzf/ (static, no runtime dep)"
+            fi
 
             # --- phpize ---
             PHPIZE="phpize${SERIES}"

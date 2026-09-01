@@ -127,11 +127,12 @@ jobs:
             sleep 5
           done
 
-          # liblzf-dev / libzstd-dev / liblz4-dev: compression deps for redis
+          # libzstd-dev / liblz4-dev: compression deps for redis (dynamic —
+          # both are base packages on Ubuntu, always present at runtime)
           # redis-server: local instance for the functional round-trip test
           sudo apt-get install -y --no-install-recommends \
             build-essential checkinstall pkg-config git \
-            liblzf-dev libzstd-dev liblz4-dev \
+            libzstd-dev liblz4-dev \
             redis-server redis-tools
 
           # Install our PHP 8.6 debs (provides php, phpize8.6, php-config8.6)
@@ -169,13 +170,26 @@ jobs:
           echo "::endgroup::"
 
           # ------------------------------------------------------------
-          # 2. configure — defaults identical to build-php.yml, ONLY
-          #    compression flags added on top
+          # 2. Bundle liblzf sources (develop no longer ships liblzf/ dir).
+          #    Static build => redis.so gets NO runtime dependency on
+          #    liblzf.so.1 (zstd/lz4 stay dynamic — base packages)
+          # ------------------------------------------------------------
+          echo "::group::bundle liblzf (static)"
+          curl -fsSL https://deb.debian.org/debian/pool/main/libl/liblzf/liblzf_3.6.orig.tar.gz -o liblzf.tgz
+          mkdir -p liblzf
+          tar xzf liblzf.tgz -C liblzf --strip-components=1
+          rm -f liblzf.tgz
+          ls liblzf/ | head -6
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 3. configure — defaults identical to build-php.yml, ONLY
+          #    compression flags added on top (lzf uses bundled sources)
           # ------------------------------------------------------------
           echo "::group::configure (compression enabled)"
           ./configure \
             --with-php-config="$PCONF" \
-            --enable-redis-lzf --with-liblzf \
+            --enable-redis-lzf \
             --enable-redis-zstd \
             --with-libzstd \
             --enable-redis-lz4 \
@@ -239,6 +253,14 @@ jobs:
           # ------------------------------------------------------------
           echo "::group::verify compiled-in compression"
           REDIS_SO="$WORK/redis/modules/redis.so"
+
+          # No liblzf runtime dependency allowed (statically bundled)
+          if ldd "$REDIS_SO" | grep -qi lzf; then
+            echo "::error::redis.so still dynamically links liblzf — runtime dep leak"
+            exit 1
+          fi
+          echo "ldd: no liblzf dependency (statically bundled) OK"
+
           INFO=$("$PHP_BIN" -d extension="$REDIS_SO" -i)
           echo "$INFO" | grep -A8 "^redis$" || true
           SER_LINE=$(echo "$INFO" | grep -i "^Available serializers" | head -1 || true)
