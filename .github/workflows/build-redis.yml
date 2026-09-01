@@ -137,6 +137,17 @@ jobs:
             sleep 5
           done
 
+          # Add packages.sury.org/php (runtime dependency: php-common).
+          # Our php8.6-* packages require php-common (>= 2:95~) which stock
+          # jammy does not provide -- same setup as build-php.yml/e2e jobs.
+          curl -fsSL https://packages.sury.org/php/apt.gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-php.gpg
+          echo "deb https://packages.sury.org/php/ jammy main" | sudo tee /etc/apt/sources.list.d/sury-php.list > /dev/null
+          for attempt in 1 2 3; do
+            if sudo timeout 60 apt-get update; then break; fi
+            [ "$attempt" -eq 3 ] && { echo "::error::sury apt-get update failed"; exit 1; }
+            sleep 5
+          done
+
           # libzstd-dev / liblz4-dev: zstd + lz4 compression support
           # redis-server: local instance for the functional round-trip test
           sudo apt-get install -y --no-install-recommends \
