@@ -51,7 +51,8 @@ Built automatically in the `build-pecl` job. To add or remove extensions,
 edit the `EXTENSIONS` variable in `build-php.yml`.
 
 Imagick and msgpack include build-time patches for PHP 8.6 API compatibility.
-Redis is built with compression support (lzf, zstd, lz4).
+Redis is built with the igbinary serializer and compression support
+(lzf, zstd, lz4).
 
 ### Smart release management
 
@@ -164,6 +165,22 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 ---
 
 ## Changelog
+
+### 2026-09-01 — Redis igbinary serializer + JSON decompression fix
+
+- `php8.6-redis` now also ships the **igbinary serializer**
+  (`Available serializers => php, json, igbinary`) — parity with the
+  sury.org `php8.5-redis` package, which Object Cache Pro requires
+- The `.deb` declares `Depends: php8.6-igbinary`; igbinary.so must be
+  loaded **before** redis.so (`zend_module_dep`: REQUIRED)
+- Fixed a latent PHP 8.6 issue: the json scanner detects end-of-input via
+  a NUL byte and reads past `val_len`, so `SERIALIZER_JSON` combined with
+  compression (zstd/lz4/lzf) failed or passed depending on heap contents.
+  phpredis decompress buffers are now NUL-terminated
+  (`.github/patches/fix_redis_library_nul.py`, applied by both
+  `build-redis.yml` and `build-php.yml` after cloning phpredis)
+- Functional test matrix expanded to 10 round-trips
+  (igbinary/php/json × none/lzf/zstd/lz4) — all green
 
 ### 2026-09-01 — Redis compression support (lzf / zstd / lz4)
 
