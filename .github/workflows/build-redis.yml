@@ -1,0 +1,423 @@
+name: Repackage phpredis (full serializer + compression support)
+
+# ==========================================================================
+# Dedicated builder for the PHP Redis extension (phpredis).
+#
+# Why this exists: the redis extension produced by build-php.yml is compiled
+# with DEFAULT configure flags only (no serializer/compression support).
+# This workflow repackages php8.6-redis with FULL support:
+#
+#   Serializers:  php, json, igbinary, msgpack
+#   Compression:  lzf, zstd, lz4
+#
+# How it works (fast, ~5 min, does NOT rebuild PHP from source):
+#   1. Downloads existing .deb packages from a GitHub Release
+#   2. Installs PHP 8.6 (cli/dev/common) from those .debs
+#   3. Builds igbinary + msgpack from pinned tags (headers for redis
+#      compile-time detection + .so modules for the functional test)
+#   4. Builds phpredis with all serializer/compression flags:
+#        --enable-redis-igbinary --enable-redis-msgpack
+#        --enable-redis-lzf
+#        --enable-redis-zstd --with-libzstd
+#        --enable-redis-lz4  --with-liblz4
+#   5. Verifies compiled-in support via phpinfo + constants (hard gate)
+#   6. Runs a functional serializer/compression round-trip test against a
+#      local redis-server (hard gate)
+#   7. Publishes: replaces php8.6-redis_*.deb on the release (smart upsert,
+#      old revision assets are deleted so users only get the new build)
+#
+# Run it from: Actions -> "Repackage phpredis" -> Run workflow
+# ==========================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to download PHP debs from and publish to (empty = latest release)'
+        type: string
+        default: ''
+      redis_ref:
+        description: 'phpredis git tag/branch to build'
+        type: string
+        default: '6.3.0RC1'
+      igbinary_ref:
+        description: 'igbinary git tag (header/module provider)'
+        type: string
+        default: '3.2.17RC1'
+      msgpack_ref:
+        description: 'msgpack-php git tag (header/module provider)'
+        type: string
+        default: 'v3.0.1'
+      target_series:
+        description: 'PHP series (must match the release debs)'
+        type: string
+        default: '8.6'
+      pkg_revision:
+        description: 'Debian package revision (-N suffix)'
+        type: string
+        default: '2'
+      publish:
+        description: 'Replace php8.6-redis_*.deb on the release when build + tests pass'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-redis:
+    name: Build phpredis with full support
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v7
+
+      # ----------------------------------------------------------------
+      # Resolve target release (explicit input, or latest)
+      # ----------------------------------------------------------------
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo '${{ github.repository }}' --json tagName --jq .tagName)
+          fi
+          echo "Target release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # Download pre-built PHP .deb files from the release
+      # ----------------------------------------------------------------
+      - name: Download PHP .deb files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p php-debs
+          gh release download '${{ steps.tag.outputs.tag }}' \
+            --repo '${{ github.repository }}' \
+            --pattern '*.deb' \
+            --dir php-debs/
+          echo "Downloaded $(ls php-debs/*.deb | wc -l) .deb files"
+          ls php-debs/ | head -5
+
+      # ----------------------------------------------------------------
+      # Install system build deps + our PHP 8.6
+      # ----------------------------------------------------------------
+      - name: Install PHP and build dependencies
+        run: |
+          set -eo pipefail
+
+          sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          APT::Get::Assume-Yes "true";
+          EOF
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/azure-cli.list
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo "https://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          for attempt in 1 2 3; do
+            if sudo timeout 90 apt-get update; then break; fi
+            [ "$attempt" -eq 3 ] && { echo "::error::apt-get update failed"; exit 1; }
+            sleep 5
+          done
+
+          # libzstd-dev / liblz4-dev: zstd + lz4 compression support
+          # redis-server: local instance for the functional round-trip test
+          sudo apt-get install -y --no-install-recommends \
+            build-essential checkinstall pkg-config git \
+            libzstd-dev liblz4-dev \
+            redis-server redis-tools
+
+          # Install our PHP 8.6 debs (provides php, phpize8.6, php-config8.6)
+          sudo dpkg -i php-debs/*.deb || sudo apt-get -f install -y
+          php${{ inputs.target_series }} -v
+
+      # ----------------------------------------------------------------
+      # Build igbinary + msgpack + phpredis, package, verify, test
+      # ----------------------------------------------------------------
+      - name: Build and package phpredis with full support
+        id: build
+        run: |
+          set -euo pipefail
+
+          SERIES="${{ inputs.target_series }}"
+          PHP_BIN="php${SERIES}"
+          PHPIZE="phpize${SERIES}"
+          PCONF="/usr/bin/php-config${SERIES}"
+          [ ! -x "$PCONF" ] && PCONF="$(command -v php-config)"
+          PHP_INC="$("$PCONF" --include-dir)"
+          WORK="$PWD/redis-work"
+          mkdir -p "$WORK"
+
+          echo "PHP include dir : $PHP_INC"
+          echo "php-config      : $PCONF"
+
+          # ------------------------------------------------------------
+          # 1. igbinary (pinned tag) -> headers + test module
+          # ------------------------------------------------------------
+          echo "::group::igbinary ${{ inputs.igbinary_ref }}"
+          git clone --depth 1 --branch '${{ inputs.igbinary_ref }}' \
+            https://github.com/igbinary/igbinary.git "$WORK/igbinary"
+          cd "$WORK/igbinary"
+          "$PHPIZE"
+          ./configure --with-php-config="$PCONF"
+          make -j"$(nproc)"
+
+          # Expose headers where phpredis configure expects them:
+          #   $PHP_INC/ext/igbinary/igbinary.h  (included as "igbinary/igbinary.h")
+          sudo mkdir -p "$PHP_INC/ext/igbinary"
+          sudo cp --parents igbinary.h php_igbinary.h "$PHP_INC/ext/igbinary/"
+          sudo cp --parents src/php7/igbinary.h "$PHP_INC/ext/igbinary/"
+          echo "Headers installed to $PHP_INC/ext/igbinary"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 2. msgpack (pinned tag) -> headers + test module
+          #    (phpredis requires PHP_MSGPACK_VERSION >= 2.0.3)
+          # ------------------------------------------------------------
+          echo "::group::msgpack ${{ inputs.msgpack_ref }}"
+          git clone --depth 1 --branch '${{ inputs.msgpack_ref }}' \
+            https://github.com/msgpack/msgpack-php.git "$WORK/msgpack"
+          cd "$WORK/msgpack"
+          "$PHPIZE"
+          ./configure --with-php-config="$PCONF"
+          make -j"$(nproc)"
+
+          sudo mkdir -p "$PHP_INC/ext/msgpack"
+          sudo cp *.h "$PHP_INC/ext/msgpack/"
+          echo "Headers installed to $PHP_INC/ext/msgpack"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 3. phpredis with FULL serializer/compression support
+          # ------------------------------------------------------------
+          echo "::group::phpredis ${{ inputs.redis_ref }} configure + make"
+          git clone --depth 1 --branch '${{ inputs.redis_ref }}' \
+            https://github.com/phpredis/phpredis.git "$WORK/redis"
+          cd "$WORK/redis"
+          "$PHPIZE"
+          ./configure \
+            --with-php-config="$PCONF" \
+            --enable-redis-igbinary \
+            --enable-redis-msgpack \
+            --enable-redis-lzf \
+            --enable-redis-zstd \
+            --with-libzstd \
+            --enable-redis-lz4 \
+            --with-liblz4 2>&1 | tee configure.log
+
+          # Hard gate: configure must have resolved every optional dep
+          for feat in igbinary msgpack liblzf libzstd liblz4; do
+            if grep -qiE "(Cannot find|not found|Please reinstall).*$feat|only system $feat is supported" configure.log; then
+              echo "::error::phpredis configure could not resolve '$feat' support"
+              exit 1
+            fi
+          done
+          make -j"$(nproc)"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 4. Package as .deb via checkinstall (same convention as
+          #    build-php.yml: pkgname php8.6-redis, version from
+          #    package.xml, revision from input)
+          # ------------------------------------------------------------
+          echo "::group::checkinstall packaging"
+          EXT_VER=$(grep -oP '<release>\K[^<]+' package.xml | head -1) || true
+          if [ -z "$EXT_VER" ]; then
+            EXT_VER=$(git describe --tags 2>/dev/null | sed 's/^v//') || true
+          fi
+          [ -z "$EXT_VER" ] && EXT_VER="0.0.0~$(git rev-parse --short HEAD)"
+          [[ ! "$EXT_VER" =~ ^[0-9] ]] && EXT_VER="0.0.0~${EXT_VER}"
+          echo "phpredis version: $EXT_VER (revision ${{ inputs.pkg_revision }})"
+
+          sudo checkinstall -D \
+            --pkgname="php${SERIES}-redis" \
+            --pkgversion="$EXT_VER" \
+            --pkgrelease="${{ inputs.pkg_revision }}" \
+            --maintainer="markusfoo" \
+            --pkgsource="PECL" \
+            --pkggroup="php" \
+            --nodoc \
+            --fstrans=no \
+            --backup=no \
+            --install=no \
+            -y make install 2>&1 | tee checkinstall.log
+
+          DEB=$(ls -t *.deb 2>/dev/null | head -1 || true)
+          if [ -z "$DEB" ]; then
+            echo "::error::checkinstall produced no .deb file"
+            exit 1
+          fi
+          mv "$DEB" "$GITHUB_WORKSPACE/"
+          echo "Built: $DEB"
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$EXT_VER" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 5. VERIFY compiled-in support (hard gate before publish)
+          # ------------------------------------------------------------
+          echo "::group::verify compiled-in support"
+          REDIS_SO="$WORK/redis/modules/redis.so"
+          INFO=$("$PHP_BIN" -d extension="$REDIS_SO" -i)
+          echo "$INFO" | grep -A6 "^redis$" || true
+          SER_LINE=$(echo "$INFO" | grep -i "serializer" | head -1 || true)
+          COM_LINE=$(echo "$INFO" | grep -i "compression" | head -1 || true)
+          echo "Serializers line : $SER_LINE"
+          echo "Compression line : $COM_LINE"
+
+          VERIFY_FAIL=0
+          for tok in igbinary msgpack; do
+            if ! echo "$SER_LINE" | grep -qi "$tok"; then
+              echo "::error::Serializer '$tok' is NOT compiled in (missing from: $SER_LINE)"
+              VERIFY_FAIL=1
+            fi
+          done
+          for tok in lzf zstd lz4; do
+            if ! echo "$COM_LINE" | grep -qi "$tok"; then
+              echo "::error::Compression '$tok' is NOT compiled in (missing from: $COM_LINE)"
+              VERIFY_FAIL=1
+            fi
+          done
+          [ "$VERIFY_FAIL" -eq 0 ] || exit 1
+
+          "$PHP_BIN" -d extension="$REDIS_SO" -r '
+            $need = [
+              "Redis::SERIALIZER_IGBINARY" => Redis::SERIALIZER_IGBINARY,
+              "Redis::SERIALIZER_MSGPACK"  => Redis::SERIALIZER_MSGPACK,
+              "Redis::COMPRESSION_LZF"     => Redis::COMPRESSION_LZF,
+              "Redis::COMPRESSION_ZSTD"    => Redis::COMPRESSION_ZSTD,
+              "Redis::COMPRESSION_LZ4"     => Redis::COMPRESSION_LZ4,
+            ];
+            foreach ($need as $name => $val) {
+              printf("%-28s = %d OK\n", $name, $val);
+            }
+          ' || { echo "::error::constant verification failed"; exit 1; }
+          echo "All serializer/compression support VERIFIED"
+          echo "::endgroup::"
+
+          # ------------------------------------------------------------
+          # 6. Functional round-trip test against local redis-server
+          # ------------------------------------------------------------
+          echo "::group::functional round-trip test"
+          sudo systemctl start redis-server 2>/dev/null || sudo redis-server --daemonize yes --save '' --appendonly no
+          for i in $(seq 1 10); do
+            redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          redis-cli ping || { echo "::error::redis-server did not start"; exit 1; }
+
+          cat > "$WORK/test_redis.php" <<'PHP'
+          <?php
+          $redis = new Redis();
+          $redis->connect('127.0.0.1', 6379);
+          $data = [
+            'name'    => 'php-apt-builder',
+            'numbers' => range(1, 500),
+            'blob'    => str_repeat('x', 2048),
+          ];
+          $tests = [
+            [Redis::SERIALIZER_IGBINARY, Redis::COMPRESSION_LZ4,  'igbinary + lz4 '],
+            [Redis::SERIALIZER_MSGPACK,  Redis::COMPRESSION_ZSTD, 'msgpack  + zstd'],
+            [Redis::SERIALIZER_PHP,      Redis::COMPRESSION_LZF,  'php      + lzf '],
+            [Redis::SERIALIZER_JSON,     Redis::COMPRESSION_NONE, 'json     + none'],
+          ];
+          $failed = 0;
+          foreach ($tests as [$ser, $comp, $label]) {
+            $redis->setOption(Redis::OPT_SERIALIZER, $ser);
+            $redis->setOption(Redis::OPT_COMPRESSION, $comp);
+            $redis->del('testkey');
+            $redis->set('testkey', $data);
+            $back = $redis->get('testkey');
+            $ok = ($back === $data);
+            printf("  %-16s round-trip: %s\n", $label, $ok ? 'OK' : 'FAIL');
+            if (!$ok) { $failed++; }
+          }
+          exit($failed ? 1 : 0);
+          PHP
+
+          "$PHP_BIN" \
+            -d extension="$WORK/igbinary/modules/igbinary.so" \
+            -d extension="$WORK/msgpack/modules/msgpack.so" \
+            -d extension="$REDIS_SO" \
+            "$WORK/test_redis.php" || {
+              echo "::error::functional round-trip test FAILED"
+              exit 1
+            }
+          echo "Functional round-trip test PASSED"
+          echo "::endgroup::"
+
+      # ----------------------------------------------------------------
+      # Publish: replace php8.6-redis_*.deb on the release
+      # ----------------------------------------------------------------
+      - name: Publish to release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.tag.outputs.tag }}'
+          REPO='${{ github.repository }}'
+          SERIES='${{ inputs.target_series }}'
+          DEB='${{ steps.build.outputs.deb }}'
+
+          # Delete previous redis .deb assets (smart upsert)
+          PREFIX="php${SERIES}-redis_"
+          OLD_IDS=$(gh api "repos/$REPO/releases/tags/$TAG" | jq -r --arg p "$PREFIX" '.assets[] | select(.name | startswith($p)) | .id')
+          for ID in $OLD_IDS; do
+            OLD_NAME=$(gh api "repos/$REPO/releases/assets/$ID" --jq .name)
+            echo "Deleting old asset: $OLD_NAME (id=$ID)"
+            gh api -X DELETE "repos/$REPO/releases/assets/$ID"
+          done
+
+          echo "Uploading $DEB to release $TAG"
+          gh release upload "$TAG" "$DEB" --repo "$REPO" --clobber
+
+          # Prepend a note to the release body (keep original notes)
+          gh release view "$TAG" --repo "$REPO" --json body --jq .body > /tmp/old_body.md || echo "" > /tmp/old_body.md
+          {
+            echo "### $(date -u +%Y-%m-%d) — php${SERIES}-redis repackaged with full serializer/compression support"
+            echo
+            echo "- phpredis \`${{ inputs.redis_ref }}\` built with: **igbinary + msgpack** serializers, **lzf + zstd + lz4** compression"
+            echo "- New asset: \`${DEB}\` (replaces previous php${SERIES}-redis_*.deb)"
+            echo
+            echo "<details><summary>Original release notes</summary>"
+            echo
+            cat /tmp/old_body.md
+            echo
+            echo "</details>"
+          } > /tmp/new_body.md
+          gh release edit "$TAG" --repo "$REPO" --notes-file /tmp/new_body.md \
+            || echo "::warning::release body update failed (asset already uploaded)"
+
+      # ----------------------------------------------------------------
+      # Job summary
+      # ----------------------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## phpredis repackage summary"
+            echo
+            if [ '${{ job.status }}' = 'success' ]; then
+              echo "| Item | Value |"
+              echo "|---|---|"
+              echo "| Release | \`${{ steps.tag.outputs.tag }}\` |"
+              echo "| phpredis | \`${{ inputs.redis_ref }}\` |"
+              echo "| Package | \`${{ steps.build.outputs.deb }}\` |"
+              echo "| Serializers | php, json, **igbinary**, **msgpack** |"
+              echo "| Compression | **lzf**, **zstd**, **lz4** |"
+              echo "| Gates passed | configure flags, phpinfo, constants, functional round-trip |"
+            else
+              echo "Build FAILED — see the failed step logs above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

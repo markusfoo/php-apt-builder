@@ -596,7 +596,8 @@ jobs:
             checkinstall php-pear \
             libmagickwand-dev libmagickcore-dev \
             libmemcached-dev zlib1g-dev libsasl2-dev \
-            libssl-dev libcurl4-openssl-dev
+            libssl-dev libcurl4-openssl-dev \
+            libzstd-dev liblz4-dev
 
       - name: Build PECL extensions
         run: |
@@ -606,7 +607,7 @@ jobs:
           # PECL extensions to build.
           # All 8 are confirmed to compile against PHP 8.6 with patches.
           # ------------------------------------------------------------------
-          EXTENSIONS="xdebug redis igbinary msgpack apcu mongodb imagick memcached"
+          EXTENSIONS="xdebug igbinary msgpack redis apcu mongodb imagick memcached"
 
           SERIES="${{ inputs.target_series }}"
           OUT_DIR="$PWD/pecl-builds"
@@ -712,6 +713,7 @@ jobs:
             case "$EXT" in
               imagick)   CONF_EXTRA="--with-imagick" ;;
               memcached) CONF_EXTRA="--with-libmemcached-dir=/usr --disable-memcached-sasl" ;;
+              redis)     CONF_EXTRA="--enable-redis-igbinary --enable-redis-msgpack --enable-redis-lzf --enable-redis-zstd --with-libzstd --enable-redis-lz4 --with-liblz4" ;;
             esac
 
             echo "Running configure --with-php-config=$PCONF $CONF_EXTRA ..."
@@ -756,6 +758,24 @@ jobs:
                 mv "$CREATED" "${OUT_DIR}/"
                 PASS=$((PASS+1))
                 echo "  Built: $(basename "$CREATED")"
+                # Serializer deps for phpredis: expose headers in the PHP
+                # include dir. igbinary/msgpack MUST come before redis in
+                # EXTENSIONS so headers exist when phpredis configures.
+                case "$EXT" in
+                  igbinary)
+                    PHP_INC="$(php-config${SERIES} --include-dir)"
+                    sudo mkdir -p "$PHP_INC/ext/igbinary"
+                    sudo cp --parents igbinary.h php_igbinary.h "$PHP_INC/ext/igbinary/" 2>/dev/null || true
+                    sudo cp --parents src/php7/igbinary.h "$PHP_INC/ext/igbinary/" 2>/dev/null || true
+                    echo "  [HEADERS] igbinary headers -> $PHP_INC/ext/igbinary (for phpredis)"
+                    ;;
+                  msgpack)
+                    PHP_INC="$(php-config${SERIES} --include-dir)"
+                    sudo mkdir -p "$PHP_INC/ext/msgpack"
+                    sudo cp $(ls *.h 2>/dev/null) "$PHP_INC/ext/msgpack/" 2>/dev/null || true
+                    echo "  [HEADERS] msgpack headers -> $PHP_INC/ext/msgpack (for phpredis)"
+                    ;;
+                esac
               else
                 echo "::warning::checkinstall succeeded but no .deb found for $EXT"
                 echo "  pwd=$(pwd)  ls=$(ls *.deb 2>&1 || true)"
