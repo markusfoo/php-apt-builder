@@ -166,7 +166,7 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 ## Changelog
 
-### 2026-09-01 — Redis igbinary serializer + JSON decompression fix
+### 2026-09-01 — Redis igbinary serializer + JSON decompression fix + compression support (lzf / zstd / lz4)
 
 - `php8.6-redis` now also ships the **igbinary serializer**
   (`Available serializers => php, json, igbinary`) — parity with the
@@ -181,9 +181,7 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
   `build-redis.yml` and `build-php.yml` after cloning phpredis)
 - Functional test matrix expanded to 10 round-trips
   (igbinary/php/json × none/lzf/zstd/lz4) — all green
-
-### 2026-09-01 — Redis compression support (lzf / zstd / lz4)
-
+  
 - The `php8.6-redis` package is now compiled with compression support:
   `--enable-redis-lzf`, `--enable-redis-zstd --with-libzstd`,
   `--enable-redis-lz4 --with-liblz4`. Serializers stay `php, json`,
