@@ -542,6 +542,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
+      # PECL sources are patched by scripts committed to this repo
+      # (.github/patches/), so this job needs an actual checkout.
+      - name: Check out this repo (for .github/patches/)
+        uses: actions/checkout@v7
+
       - name: Download built PHP .deb files
         uses: actions/download-artifact@v7
         with:
