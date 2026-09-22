@@ -177,6 +177,33 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 ## Changelog
 
+### 2026-09-22 — phpredis 6.3.0RC1 compatibility: idempotent `fix_redis_library_nul.py` (run #7 fix)
+
+- Run #7 (the first PHP 8.6.0RC1 build) failed in the PECL job:
+  `library.c patch does not match exactly once (phpredis upstream
+  changed?)`. The PECL job clones phpredis from `master`, and upstream
+  released **6.3.0RC1** between run #5 (2026-09-09, green) and run #7,
+  changing `library.c`
+- Good news verified in the 6.3.0RC1 source: phpredis **upstreamed the
+  same NUL-termination fix** this repo carried since 2026-09-01 for all
+  three codecs (lzf: `safe_erealloc(..., 1)` + `data[res] = '\0'`;
+  zstd / lz4: `emalloc(len + 1)` + terminator) — the local patch had
+  simply become redundant
+- `.github/patches/fix_redis_library_nul.py` is now **idempotent**: for
+  each codec (lzf / zstd / lz4) it first checks whether the tree already
+  NUL-terminates the buffer right after the decompress call (upstream
+  fixed it → skip with a notice), and only patches when the known
+  unfixed shape is found verbatim; if neither shape is recognized it
+  still fails loudly rather than silently shipping a redis package with
+  the PHP 8.6 json EOI bug
+- Verified against the real 6.3.0RC1 tree (all three codecs detected as
+  fixed, file untouched), against a synthesized pre-6.3.0 tree (all
+  three patches applied, re-run is a no-op) and against an unrecognized
+  refactor (hard error, exit 1)
+- Also confirmed unchanged in 6.3.0RC1: the configure flags
+  (`--enable-redis-igbinary/lzf/zstd/lz4 --with-libzstd --with-liblz4`)
+  and the bundled `liblzf/` static-build fallback the workflow relies on
+
 ### 2026-09-22 — PHP 8.6.0RC1 support: input canonicalization in `resolve` (run #6 fix)
 
 - Run #6 failed at the very first step ("Confirm php_tag exists in
