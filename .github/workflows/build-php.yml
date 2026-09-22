@@ -62,27 +62,50 @@ name: Build PHP Packages (Ubuntu 22.04 / jammy)
 #   description is automatically updated with a dated entry listing any
 #   newly added PECL extensions.  If no release exists, a new one is created
 #   with full metadata and a PECL extensions table.
+#
+# ----------------------------------------------------------------------------
+# PRE-RELEASE TAG/VERSION CANONICALIZATION (added after run #6 failed to
+# resolve php-8.6.0RC1):
+#
+#   php/php-src tags pre-release milestones with INCONSISTENT casing:
+#     php-8.6.0alpha1 / php-8.6.0beta3  (lowercase)
+#     php-8.6.0RC1                      (UPPERCASE "RC")
+#   The old resolve job required a byte-perfect php_tag, so dispatching with
+#   "php-8.6.0rc1" (the natural lowercase guess) died at the very first step.
+#   The resolve job now:
+#     1. tries the exact tag first, then falls back to a case-insensitive
+#        match against the full php-src tag list (php-8.6.0rc1 ->
+#        php-8.6.0RC1), also tolerating a missing "php-" prefix;
+#     2. derives the canonical Debian upstream version FROM the resolved tag
+#        (php-8.6.0RC1 -> 8.6.0~rc1) and normalizes the manual input to it:
+#        Debian pre-release suffixes must be LOWERCASE, because dpkg compares
+#        bytes and "8.6.0~RC1" sorts BEFORE "8.6.0~beta3" (R < b), which apt
+#        would treat as a DOWNGRADE from any installed beta;
+#     3. hard-fails if pkg_upstream_version disagrees with the tag beyond
+#        casing (a "+local" suffix is still allowed);
+#     4. exports both as job outputs -- every downstream job (assemble,
+#        compile, publish) uses the RESOLVED values, never the raw inputs.
 # =============================================================================
 
 on:
   workflow_dispatch:
     inputs:
       php_tag:
-        description: "Git tag in php/php-src to build"
+        description: "Git tag in php/php-src to build (case-insensitive; canonicalized by the resolve job)"
         type: string
-        default: "php-8.6.0beta2"
+        default: "php-8.6.0RC1"
       target_series:
         description: "PHP series -- must match packaging/debian/ (phpX.Y-*)"
         type: string
         default: "8.6"
       pkg_upstream_version:
-        description: "Debian-ordered upstream version string (~ sorts before nothing, so ~beta1 < final)"
+        description: "Debian-ordered upstream version (~ sorts before nothing, so ~beta1 < final; pre-release suffix lowercase: 8.6.0~rc1)"
         type: string
-        default: "8.6.0~beta2"
+        default: "8.6.0~rc1"
       pkg_revision:
         description: "Debian package revision suffix"
         type: string
-        default: "2"
+        default: "1"
       publish:
         description: "Create a GitHub Release with .deb packages if build + smoke-test pass"
         type: boolean
@@ -112,21 +135,93 @@ jobs:
     name: Resolve inputs
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      php_tag: ${{ steps.resolve_tag.outputs.php_tag }}
+      pkg_upstream_version: ${{ steps.resolve_version.outputs.pkg_upstream_version }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Confirm php_tag exists in php/php-src
+      # php-src tags pre-releases with mixed casing (php-8.6.0beta3 but
+      # php-8.6.0RC1), so a byte-perfect tag requirement failed the very
+      # first step for the natural lowercase spelling. Try the exact tag
+      # first; if it does not exist, canonicalize case-insensitively
+      # against the full tag list (also tolerating a missing "php-" prefix).
+      - name: Resolve php_tag against php/php-src (exact, then case-insensitive)
+        id: resolve_tag
+        env:
+          WANT: ${{ inputs.php_tag }}
         run: |
           set -euxo pipefail
+          # Fast path: the tag exists verbatim.
+          if timeout 30 git ls-remote --exit-code --tags https://github.com/php/php-src.git "refs/tags/${WANT}" >/dev/null 2>&1; then
+            echo "php_tag=${WANT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::warning::Tag '${WANT}' not found verbatim; fetching the full php-src tag list to canonicalize (php-src mixes lowercase alpha/beta with UPPERCASE RC tags)..."
           for attempt in 1 2 3; do
-            if timeout 30 git ls-remote --exit-code --tags https://github.com/php/php-src.git "refs/tags/${{ inputs.php_tag }}" >/dev/null; then
-              exit 0
+            if timeout 60 git ls-remote --tags https://github.com/php/php-src.git > /tmp/all-tags.txt; then
+              break
             fi
             echo "::warning::git ls-remote attempt ${attempt} failed or hung, retrying in 5s..."
             sleep 5
           done
-          echo "::error::Tag '${{ inputs.php_tag }}' not found in php/php-src (or GitHub was unreachable after 3 attempts)."
+          if [ ! -s /tmp/all-tags.txt ]; then
+            echo "::error::Could not list php/php-src tags after 3 attempts (or GitHub was unreachable)."
+            exit 1
+          fi
+          sed 's|^.*[[:space:]]refs/tags/||; s|\^{}$||' /tmp/all-tags.txt | sort -u > /tmp/tags.txt
+          # Case-insensitive match, unique hit wins; also try adding the "php-" prefix.
+          MATCHES=$(grep -ixF "${WANT}" /tmp/tags.txt || true)
+          if [ -z "$MATCHES" ] && [ "${WANT#php-}" = "$WANT" ]; then
+            MATCHES=$(grep -ixF "php-${WANT}" /tmp/tags.txt || true)
+          fi
+          N=$(printf '%s\n' "$MATCHES" | grep -c . || true)
+          if [ "${N:-0}" -eq 1 ]; then
+            CANON=$(printf '%s\n' "$MATCHES")
+            echo "::notice::Input '${WANT}' canonicalized to tag '${CANON}'."
+            echo "php_tag=${CANON}" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "${N:-0}" -gt 1 ]; then
+            echo "::error::Input '${WANT}' matches several tags (case-insensitive): $(echo ${MATCHES})"
+            exit 1
+          fi
+          echo "::error::Tag '${WANT}' not found in php/php-src (also tried case-insensitively). Available php-8.6.x tags:"
+          grep -E '^php-8\.6\.' /tmp/tags.txt | sort -V | tail -25
           exit 1
+
+      # Derive the Debian upstream version from the canonical tag and
+      # normalize the manual input to it. Debian pre-release suffixes must
+      # be lowercase: dpkg compares bytes, so "8.6.0~RC1" sorts BEFORE
+      # "8.6.0~beta3" (R < b) and apt would treat RC1 as a DOWNGRADE from
+      # an installed beta. A version that disagrees with the tag beyond
+      # casing (a "+local" suffix is fine) is a hard error.
+      - name: Normalize pkg_upstream_version and cross-check against the tag
+        id: resolve_version
+        env:
+          PHP_TAG: ${{ steps.resolve_tag.outputs.php_tag }}
+          INPUT_VER: ${{ inputs.pkg_upstream_version }}
+        run: |
+          set -euxo pipefail
+          BASE=$(printf '%s' "$PHP_TAG" | sed 's/^php-//; s/\(alpha\|beta\|rc\|RC\)[0-9]*$//')
+          SUFFIX=$(printf '%s' "$PHP_TAG" | sed -n 's/^php-[0-9][0-9.]*\([a-zA-Z][a-zA-Z]*[0-9]*\)$/\1/p' | tr 'A-Z' 'a-z')
+          if [ -n "$SUFFIX" ]; then
+            EXPECTED="${BASE}~${SUFFIX}"
+          else
+            EXPECTED="${BASE}"
+          fi
+          NORMALIZED=$(printf '%s' "$INPUT_VER" | sed 's/\([a-zA-Z]*\)\([0-9]*\)$/\L\1\2/')
+          if [ "$INPUT_VER" != "$NORMALIZED" ]; then
+            echo "::warning::pkg_upstream_version '${INPUT_VER}' normalized to '${NORMALIZED}' (Debian pre-release suffixes must be lowercase: 8.6.0~rc1, not 8.6.0~RC1 -- uppercase would sort older than ~beta3 and break apt upgrades from betas)."
+          fi
+          case "$NORMALIZED" in
+            "$EXPECTED"|"$EXPECTED"+*)
+              ;;
+            *)
+              echo "::error::pkg_upstream_version '${NORMALIZED}' does not match php_tag '${PHP_TAG}' (expected '${EXPECTED}'). Note: the tag follows php-src casing (RC uppercase), the Debian version uses lowercase (8.6.0~rc1)."
+              exit 1
+              ;;
+          esac
+          echo "pkg_upstream_version=${NORMALIZED}" >> "$GITHUB_OUTPUT"
 
       - name: Confirm packaging/debian/ exists and matches target_series
         run: |
@@ -217,7 +312,7 @@ jobs:
         run: |
           set -euxo pipefail
           for attempt in 1 2; do
-            if timeout 300 git clone --branch "${{ inputs.php_tag }}" --depth 1 https://github.com/php/php-src.git src; then
+            if timeout 300 git clone --branch "${{ needs.resolve.outputs.php_tag }}" --depth 1 https://github.com/php/php-src.git src; then
               break
             fi
             echo "::warning::git clone attempt ${attempt} failed or hung, retrying in 5s..."
@@ -226,31 +321,31 @@ jobs:
             [ "$attempt" -eq 2 ] && { echo "::error::git clone of php-src failed after 2 attempts."; exit 1; }
           done
           rm -rf src/.git
-          ORIG_DIR="${PKG}-${{ inputs.pkg_upstream_version }}"
+          ORIG_DIR="${PKG}-${{ needs.resolve.outputs.pkg_upstream_version }}"
           mv src "$ORIG_DIR"
-          tar --sort=name --owner=0 --group=0 -cJf "${PKG}_${{ inputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR"
+          tar --sort=name --owner=0 --group=0 -cJf "${PKG}_${{ needs.resolve.outputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR"
           mkdir -p build-area
-          mv "${PKG}_${{ inputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR" build-area/
+          mv "${PKG}_${{ needs.resolve.outputs.pkg_upstream_version }}.orig.tar.xz" "$ORIG_DIR" build-area/
           cp -r packaging/debian "build-area/${ORIG_DIR}/debian"
 
       - name: Add changelog entry for this build
-        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        working-directory: build-area/${{ env.PKG }}-${{ needs.resolve.outputs.pkg_upstream_version }}
         run: |
           set -euxo pipefail
           export DEBEMAIL="ci@example.com"
           export DEBFULLNAME="Custom PHP CI"
           dch -b --package "$PKG" \
-              --newversion "${{ inputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}" \
+              --newversion "${{ needs.resolve.outputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}" \
               --distribution "$DISTRO_CODENAME" --force-distribution \
-              "Build of ${{ inputs.php_tag }}."
+              "Build of ${{ needs.resolve.outputs.php_tag }}."
 
       # ---- validation stage: catch problems in seconds, not after a 20-40 min compile ----
       - name: Validate build-dependencies resolve
-        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        working-directory: build-area/${{ env.PKG }}-${{ needs.resolve.outputs.pkg_upstream_version }}
         run: timeout 120 sudo apt-get build-dep --simulate .
 
       - name: Validate source package structure
-        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        working-directory: build-area/${{ env.PKG }}-${{ needs.resolve.outputs.pkg_upstream_version }}
         run: dpkg-source -b .
 
       - name: Lint the packaging
@@ -275,7 +370,7 @@ jobs:
   # ==========================================================================
   build:
     name: Compile .deb packages
-    needs: prepare-and-validate
+    needs: [prepare-and-validate, resolve]
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -379,7 +474,7 @@ jobs:
       # a short `timeout` -- it can legitimately run long; the job-level
       # `timeout-minutes: 120` above is the outer safety net for it.
       - name: Install real build-dependencies and compile
-        working-directory: build-area/${{ env.PKG }}-${{ inputs.pkg_upstream_version }}
+        working-directory: build-area/${{ env.PKG }}-${{ needs.resolve.outputs.pkg_upstream_version }}
         run: |
           set -euxo pipefail
           sudo mk-build-deps -ir -t "apt-get -y --no-install-recommends" debian/control
@@ -1285,7 +1380,7 @@ jobs:
   # ==========================================================================
   publish:
     name: Publish to GitHub Release
-    needs: [smoke-test, build-pecl, e2e-wordpress-test]
+    needs: [smoke-test, build-pecl, e2e-wordpress-test, resolve]
     if: ${{ inputs.publish }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -1318,7 +1413,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          SAFE_VERSION=$(echo "${{ inputs.pkg_upstream_version }}" | tr '~' '-')
+          SAFE_VERSION=$(echo "${{ needs.resolve.outputs.pkg_upstream_version }}" | tr '~' '-')
           VERSION_TAG="php${SAFE_VERSION}-${{ inputs.pkg_revision }}"
           RELEASE_NAME="PHP ${SAFE_VERSION}-${{ inputs.pkg_revision }}"
           SERIES="${{ inputs.target_series }}"
@@ -1326,7 +1421,7 @@ jobs:
           # -----------------------------------------------------------------
           # Pre-release flag
           # -----------------------------------------------------------------
-          if echo "${{ inputs.pkg_upstream_version }}" | grep -qE '(alpha|beta|rc|~)'; then
+          if echo "${{ needs.resolve.outputs.pkg_upstream_version }}" | grep -qiE '(alpha|beta|rc|~)'; then
             PRERELEASE_FLAG="--prerelease"
           else
             PRERELEASE_FLAG=""
@@ -1431,8 +1526,8 @@ jobs:
 
           | | |
           |---|---|
-          | **Source tag** | \`${{ inputs.php_tag }}\` |
-          | **Version** | \`${{ inputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}\` |
+          | **Source tag** | \`${{ needs.resolve.outputs.php_tag }}\` |
+          | **Version** | \`${{ needs.resolve.outputs.pkg_upstream_version }}-${{ inputs.pkg_revision }}\` |
           | **Distro** | Ubuntu 22.04 (jammy) / amd64 |
           | **Workflow run** | [#$GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) |
           NOTES_EOF

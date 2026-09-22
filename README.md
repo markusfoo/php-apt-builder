@@ -156,15 +156,54 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 | Input | Default | Meaning |
 |---|---|---|
-| `php_tag` | `php-8.6.0beta1` | Git tag in `php/php-src` to build |
+| `php_tag` | `php-8.6.0RC1` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
 | `target_series` | `8.6` | PHP series — must match `packaging/debian/` |
-| `pkg_upstream_version` | `8.6.0~beta1` | Debian-ordered upstream version (`~` sorts before nothing) |
+| `pkg_upstream_version` | `8.6.0~rc1` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
 | `pkg_revision` | `1` | Debian package revision suffix |
 | `publish` | `true` | Create/update a GitHub Release if build + smoke-test pass |
+
+> **Pre-release casing rules.** php-src tags betas lowercase but RCs
+> UPPERCASE (`php-8.6.0beta3` vs `php-8.6.0RC1`); Debian versions must use
+> lowercase everywhere (`8.6.0~rc1`, because dpkg byte comparison would sort
+> an uppercase `8.6.0~RC1` *older* than `8.6.0~beta3` and break
+> `apt upgrade` from an installed beta). The `resolve` job canonicalizes
+> both automatically: any casing of the tag is accepted (matched
+> case-insensitively against php/php-src, missing `php-` prefix tolerated),
+> the version's pre-release suffix is lowercased, and a version that
+> disagrees with the tag beyond casing (a `+local` suffix is fine) fails
+> the run immediately with the expected value printed.
 
 ---
 
 ## Changelog
+
+### 2026-09-22 — PHP 8.6.0RC1 support: input canonicalization in `resolve` (run #6 fix)
+
+- Run #6 failed at the very first step ("Confirm php_tag exists in
+  php/php-src") because php-src tags pre-releases with mixed casing —
+  `php-8.6.0beta3` is lowercase, but `php-8.6.0RC1` is UPPERCASE — and the
+  old check required a byte-perfect `php_tag` match
+- The `resolve` job now canonicalizes `php_tag`: exact match first, then a
+  case-insensitive lookup against the full php-src tag list
+  (`php-8.6.0rc1` → `php-8.6.0RC1`), also tolerating a missing `php-`
+  prefix; on failure the error message lists the available `php-8.6.x` tags
+- `pkg_upstream_version` is now normalized and cross-checked against the
+  resolved tag: the pre-release suffix is lowercased (`8.6.0~RC1` →
+  `8.6.0~rc1`) because dpkg compares bytes and an uppercase `~RC1` sorts
+  *older* than `~beta3` (verified with `dpkg --compare-versions`), which
+  apt would treat as a downgrade from an installed beta; a version that
+  disagrees with the tag beyond casing (a `+local` suffix is still
+  allowed) is a hard error that prints the expected value
+- Both resolved values are exported as `resolve` job outputs and every
+  downstream job (assemble, compile, publish) uses them instead of the
+  raw inputs — raw inputs are never trusted past `resolve`
+- The tag/version values are passed to shell steps via `env:` instead of
+  `${{ }}` interpolation, eliminating a shell-injection vector
+- Pre-release detection in the publish job is now case-insensitive
+  (`grep -qiE`)
+- `workflow_dispatch` defaults updated for the RC cycle:
+  `php_tag=php-8.6.0RC1`, `pkg_upstream_version=8.6.0~rc1`,
+  `pkg_revision=1`
 
 ### 2026-09-01 — Redis igbinary serializer + JSON decompression fix + compression support (lzf / zstd / lz4)
 
