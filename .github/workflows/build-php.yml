@@ -93,7 +93,7 @@ on:
       php_tag:
         description: "Git tag in php/php-src to build (case-insensitive; canonicalized by the resolve job)"
         type: string
-        default: "php-8.6.0RC1"
+        default: "php-8.6.0RC2"
       target_series:
         description: "PHP series -- must match packaging/debian/ (phpX.Y-*)"
         type: string
@@ -101,7 +101,7 @@ on:
       pkg_upstream_version:
         description: "Debian-ordered upstream version (~ sorts before nothing, so ~beta1 < final; pre-release suffix lowercase: 8.6.0~rc1)"
         type: string
-        default: "8.6.0~rc1"
+        default: "8.6.0~rc2"
       pkg_revision:
         description: "Debian package revision suffix"
         type: string

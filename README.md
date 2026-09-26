@@ -156,9 +156,9 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 | Input | Default | Meaning |
 |---|---|---|
-| `php_tag` | `php-8.6.0RC1` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
+| `php_tag` | `php-8.6.0RC2` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
 | `target_series` | `8.6` | PHP series — must match `packaging/debian/` |
-| `pkg_upstream_version` | `8.6.0~rc1` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
+| `pkg_upstream_version` | `8.6.0~rc2` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
 | `pkg_revision` | `1` | Debian package revision suffix |
 | `publish` | `true` | Create/update a GitHub Release if build + smoke-test pass |
 
@@ -176,6 +176,23 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 ---
 
 ## Changelog
+
+### 2026-09-26 — PHP 8.6.0RC2 support: PHPAPI bump + RC2 dispatch defaults (run #9 fix)
+
+- Run #9 (the first `php-8.6.0RC2` build) failed during packaging:
+  `PHPAPI has changed from 20250926 to 20260924, please modify
+  debian/phpapi`. RC2 raised `ZEND_MODULE_API_NO` from 20250926 (in
+  use through RC1) to 20260924; `packaging/debian/phpapi` now stores
+  **20260924**
+- Consequence of the API bump: binary extension packages built for RC1
+  or earlier betas are API-incompatible with RC2 (`php8.6-redis`,
+  `-igbinary`, `-imagick`, `-xdebug`, ...). The pipeline rebuilds every
+  extension against the fresh PHP in the same run, so the complete
+  `php8.6.0-rc2-1` release set stays internally consistent — install
+  the whole set together (the profile-manager script already mirrors
+  installed `php8.6-*` packages, which covers this)
+- `workflow_dispatch` defaults moved to the RC2 cycle:
+  `php_tag=php-8.6.0RC2`, `pkg_upstream_version=8.6.0~rc2`
 
 ### 2026-09-22 — phpredis 6.3.0RC1 compatibility: idempotent `fix_redis_library_nul.py` (run #7 fix)
 
