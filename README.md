@@ -156,9 +156,9 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 | Input | Default | Meaning |
 |---|---|---|
-| `php_tag` | `php-8.6.0RC2` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
+| `php_tag` | `php-8.6.0RC4` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
 | `target_series` | `8.6` | PHP series — must match `packaging/debian/` |
-| `pkg_upstream_version` | `8.6.0~rc2` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
+| `pkg_upstream_version` | `8.6.0~rc4` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
 | `pkg_revision` | `1` | Debian package revision suffix |
 | `publish` | `true` | Create/update a GitHub Release if build + smoke-test pass |
 
@@ -176,6 +176,36 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 ---
 
 ## Changelog
+
+### 2026-10-23 — PHP 8.6.0RC4 support: re-anchor 0045 telemetry patch (run #12 fix)
+
+- Run #12 (the first `php-8.6.0RC4` build) failed in `Assemble + validate`
+  at `Validate source package structure`: `dpkg-source -b .` exited 2
+  while applying
+  `0045-Add-minimal-privacy-preserving-secure-DNS-telemetry-.patch` —
+  `Hunk #1 FAILED at 76` for `sapi/apache2handler/config.m4`
+- Root cause: between RC3 and RC4, php-src upstream inserted a 4-line block
+  (`dnl httpd dlopen's libphp.so …` + `php_tsrm_dlopened_sapi=yes`) exactly
+  in the gap where patch 0045 anchored its `PHP_ADD_LIBRARY(sodium)`
+  insertion (between `PHP_SUBST([LIBPHP_CFLAGS])` and
+  `php_sapi_apache2handler_type=shared`), destroying the hunk's 3+3 context
+  window. `dpkg-source` applies the quilt series with `-F 0` (fuzz
+  disabled), so a still-existing-but-shifted neighbourhood is a hard
+  failure — the context must match verbatim
+- Fix: the `config.m4` hunk of 0045 is re-anchored to the RC4 tree —
+  `PHP_ADD_LIBRARY(sodium)` now sits directly after the stable
+  `LIBPHP_CFLAGS` / `PHP_SUBST([LIBPHP_CFLAGS])` pair, using the new
+  upstream dnl block as trailing context (`@@ -85,6 +85,8 @@`, blob hashes
+  refreshed). The other four hunks of 0045 apply to RC4 unchanged
+  (fuzz-free offsets −3 / −84 / −16)
+- Verified in a full clean-room repro of the `prepare-and-validate` flow
+  (orig tarball rebuilt from the `php-8.6.0RC4` tag + this `debian/`):
+  `dpkg-source -b .` exits 0 and produces `php8.6_8.6.0~rc4-1.dsc` +
+  `.debian.tar.xz` with all 45 patches applying
+- PHPAPI check: RC4 keeps `ZEND_MODULE_API_NO = 20260924` (unchanged since
+  RC2), so `packaging/debian/phpapi` stays as-is
+- `workflow_dispatch` defaults moved to the RC4 cycle:
+  `php_tag=php-8.6.0RC4`, `pkg_upstream_version=8.6.0~rc4`
 
 ### 2026-09-26 — PHP 8.6.0RC2 support: PHPAPI bump + RC2 dispatch defaults (run #9 fix)
 
