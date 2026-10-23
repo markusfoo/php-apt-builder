@@ -611,15 +611,16 @@ diff --git a/sapi/apache2handler/config.m4 b/sapi/apache2handler/config.m4
 index e754933..798f036 100644
 --- a/sapi/apache2handler/config.m4
 +++ b/sapi/apache2handler/config.m4
-@@ -76,6 +76,8 @@ if test "$PHP_APXS2" != "no"; then
+@@ -85,6 +85,8 @@ if test "$PHP_APXS2" != "no"; then
    LIBPHP_CFLAGS="-shared"
    PHP_SUBST([LIBPHP_CFLAGS])
  
 +  PHP_ADD_LIBRARY(sodium)
 +
-   php_sapi_apache2handler_type=shared
-   AS_CASE([$host_alias],
-     [*aix*], [
+   dnl httpd dlopen's libphp.so without linking against it, so we must
+   dnl use global-dynamic by default. Use -ftls-model=initial-exec to
+   dnl override the compiler choice, see UPGRADING.INTERNALS
+   php_tsrm_dlopened_sapi=yes
 diff --git a/sapi/apache2handler/php_functions.c b/sapi/apache2handler/php_functions.c
 index 84437f1..8873635 100644
 --- a/sapi/apache2handler/php_functions.c
