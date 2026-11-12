@@ -156,9 +156,9 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 
 | Input | Default | Meaning |
 |---|---|---|
-| `php_tag` | `php-8.6.0RC4` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
+| `php_tag` | `php-8.6.0RC7` | Git tag in `php/php-src` to build (case-insensitive; canonicalized by the `resolve` job) |
 | `target_series` | `8.6` | PHP series — must match `packaging/debian/` |
-| `pkg_upstream_version` | `8.6.0~rc4` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
+| `pkg_upstream_version` | `8.6.0~rc7` | Debian-ordered upstream version (`~` sorts before nothing; pre-release suffix lowercase) |
 | `pkg_revision` | `1` | Debian package revision suffix |
 | `publish` | `true` | Create/update a GitHub Release if build + smoke-test pass |
 
@@ -176,6 +176,28 @@ e2e-tests/run-all.sh /var/www/html 8.6 ./e2e-tests/logs-audit
 ---
 
 ## Changelog
+
+### 2026-11-13 — PHP 8.6.0RC7 support: PHPAPI bump to 20261112 (run #15 fix)
+
+- Run #15 (the first `php-8.6.0RC7` build) compiled for ~34 min and then
+  failed in `Install real build-dependencies and compile` with
+  `dpkg-buildpackage` exit code 2. The failing step is the PHPAPI guard in
+  `override_dh_gencontrol-arch` (`debian/rules`), which runs after the full
+  compile: `PHPAPI has changed from 20260924 to 20261112, please modify
+  debian/phpapi` (same failure class as run #9 / RC2)
+- Root cause: upstream raised `ZEND_MODULE_API_NO` from 20260924 to
+  **20261112** between RC5 and RC6 (verified in `Zend/zend_modules.h` at the
+  `php-8.6.0RC5` / `RC6` / `RC7` tags). RC4 and RC5 report 20260924, RC6
+  and RC7 report 20261112
+- Fix: `packaging/debian/phpapi` now stores **20261112**. Nothing else in
+  the packaging tree hard-codes the value
+- Consequence: this `phpapi` value is valid for RC6 and later only. To
+  rebuild RC4/RC5, temporarily restore 20260924. Extension packages built
+  against RC5 or earlier are API-incompatible with RC6+; the pipeline
+  rebuilds all PECL extensions against the fresh PHP in the same run, so
+  install the whole `php8.6.0-rc7` set together
+- `workflow_dispatch` defaults moved to the RC7 cycle:
+  `php_tag=php-8.6.0RC7`, `pkg_upstream_version=8.6.0~rc7`
 
 ### 2026-10-23 — PHP 8.6.0RC4 support: re-anchor 0045 telemetry patch (run #12 fix)
 
